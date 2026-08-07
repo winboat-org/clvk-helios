@@ -888,6 +888,11 @@ struct cvk_platform : public _cl_platform_id,
         m_extensions = {
             MAKE_NAME_VERSION(1, 0, 0, "cl_khr_icd"),
             MAKE_NAME_VERSION(1, 0, 0, "cl_khr_extended_versioning"),
+#if defined(_WIN32)
+            // Helios implements the DXGI/D3D10 device association query only;
+            // D3D10 resource-sharing entry points remain unsupported.
+            MAKE_NAME_VERSION(1, 0, 0, CL_KHR_D3D10_SHARING_EXTENSION_NAME),
+#endif
         };
 
         for (auto& ext : m_extensions) {

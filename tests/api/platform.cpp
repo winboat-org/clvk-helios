@@ -16,6 +16,10 @@
 
 #include <unordered_set>
 
+#if defined(_WIN32)
+#include <CL/cl_d3d10.h>
+#endif
+
 TEST(Platform, DeviceQueryWithMultipleTypes) {
     cl_int err;
 
@@ -51,3 +55,46 @@ TEST(Platform, InvalidContext) {
     clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &err);
     ASSERT_EQ(err, CL_INVALID_PROPERTY);
 }
+
+#if defined(_WIN32)
+TEST(Platform, D3D10DeviceAssociationExtension) {
+    size_t extension_size = 0;
+    ASSERT_EQ(clGetPlatformInfo(gPlatform, CL_PLATFORM_EXTENSIONS, 0, nullptr,
+                                &extension_size),
+              CL_SUCCESS);
+
+    std::string extensions(extension_size, '\0');
+    ASSERT_EQ(clGetPlatformInfo(gPlatform, CL_PLATFORM_EXTENSIONS,
+                                extensions.size(), extensions.data(), nullptr),
+              CL_SUCCESS);
+    ASSERT_NE(extensions.find(CL_KHR_D3D10_SHARING_EXTENSION_NAME),
+              std::string::npos);
+
+    auto get_devices = reinterpret_cast<clGetDeviceIDsFromD3D10KHR_fn>(
+        clGetExtensionFunctionAddressForPlatform(gPlatform,
+                                                 "clGetDeviceIDsFromD3D10KHR"));
+    ASSERT_NE(get_devices, nullptr);
+
+    cl_device_id device = nullptr;
+    cl_uint num_devices = 0;
+    EXPECT_EQ(get_devices(gPlatform, 0, nullptr,
+                          CL_PREFERRED_DEVICES_FOR_D3D10_KHR, 1, &device,
+                          nullptr),
+              CL_INVALID_VALUE);
+    EXPECT_EQ(get_devices(gPlatform, CL_D3D10_DXGI_ADAPTER_KHR, nullptr, 0, 1,
+                          &device, nullptr),
+              CL_INVALID_VALUE);
+    EXPECT_EQ(get_devices(gPlatform, CL_D3D10_DXGI_ADAPTER_KHR, nullptr,
+                          CL_PREFERRED_DEVICES_FOR_D3D10_KHR, 0, &device,
+                          nullptr),
+              CL_INVALID_VALUE);
+    EXPECT_EQ(get_devices(gPlatform, CL_D3D10_DXGI_ADAPTER_KHR, nullptr,
+                          CL_PREFERRED_DEVICES_FOR_D3D10_KHR, 0, nullptr,
+                          nullptr),
+              CL_INVALID_VALUE);
+    EXPECT_EQ(get_devices(gPlatform, CL_D3D10_DXGI_ADAPTER_KHR, nullptr,
+                          CL_PREFERRED_DEVICES_FOR_D3D10_KHR, 0, nullptr,
+                          &num_devices),
+              CL_INVALID_D3D10_DEVICE_KHR);
+}
+#endif

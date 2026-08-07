@@ -98,6 +98,39 @@ bool is_valid_event_wait_list(cl_uint num_events_in_wait_list,
     return true;
 }
 
+#if defined(_WIN32)
+bool get_d3d10_adapter_desc(cl_d3d10_device_source_khr source, void* d3d_object,
+                            DXGI_ADAPTER_DESC* desc) {
+    if (d3d_object == nullptr) {
+        return false;
+    }
+
+    if (source == CL_D3D10_DXGI_ADAPTER_KHR) {
+        auto adapter = static_cast<IDXGIAdapter*>(d3d_object);
+        return SUCCEEDED(adapter->GetDesc(desc));
+    }
+
+    auto d3d_device = static_cast<ID3D10Device*>(d3d_object);
+    IDXGIDevice* dxgi_device = nullptr;
+    HRESULT result = d3d_device->QueryInterface(
+        __uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgi_device));
+    if (FAILED(result)) {
+        return false;
+    }
+
+    IDXGIAdapter* adapter = nullptr;
+    result = dxgi_device->GetAdapter(&adapter);
+    dxgi_device->Release();
+    if (FAILED(result)) {
+        return false;
+    }
+
+    result = adapter->GetDesc(desc);
+    adapter->Release();
+    return SUCCEEDED(result);
+}
+#endif
+
 bool is_same_context(cl_command_queue queue, cl_mem mem) {
     return icd_downcast(queue)->context() == icd_downcast(mem)->context();
 }
@@ -309,6 +342,9 @@ static const std::unordered_map<std::string, void*> gExtensionEntrypoints = {
     EXTENSION_ENTRYPOINT(clGetSemaphoreInfoKHR),
     EXTENSION_ENTRYPOINT(clRetainSemaphoreKHR),
     EXTENSION_ENTRYPOINT(clReleaseSemaphoreKHR),
+#if defined(_WIN32)
+    EXTENSION_ENTRYPOINT(clGetDeviceIDsFromD3D10KHR),
+#endif
 #undef EXTENSION_ENTRYPOINT
 #undef FUNC_PTR
 };
@@ -401,6 +437,77 @@ cl_int CLVK_API_CALL clGetDeviceIDs(cl_platform_id platform,
 
     return CL_SUCCESS;
 }
+
+#if defined(_WIN32)
+// Helios compatibility: GPU discovery tools such as DaVinci Resolve use this
+// association query without using the resource-sharing part of the extension.
+cl_int CLVK_API_CALL clGetDeviceIDsFromD3D10KHR(
+    cl_platform_id platform, cl_d3d10_device_source_khr d3d_device_source,
+    void* d3d_object, cl_d3d10_device_set_khr d3d_device_set,
+    cl_uint num_entries, cl_device_id* devices, cl_uint* num_devices) {
+    auto state = get_or_init_global_state();
+
+    TRACE_FUNCTION("platform", (uintptr_t)platform, "d3d_device_source",
+                   d3d_device_source, "d3d_device_set", d3d_device_set,
+                   "num_entries", num_entries);
+    LOG_API_CALL("platform = %p, d3d_device_source = %u, d3d_object = %p, "
+                 "d3d_device_set = %u, num_entries = %u, devices = %p, "
+                 "num_devices = %p",
+                 platform, d3d_device_source, d3d_object, d3d_device_set,
+                 num_entries, devices, num_devices);
+
+    if (platform != state->platform()) {
+        return CL_INVALID_PLATFORM;
+    }
+
+    if (d3d_device_source != CL_D3D10_DEVICE_KHR &&
+        d3d_device_source != CL_D3D10_DXGI_ADAPTER_KHR) {
+        return CL_INVALID_VALUE;
+    }
+
+    if (d3d_device_set != CL_PREFERRED_DEVICES_FOR_D3D10_KHR &&
+        d3d_device_set != CL_ALL_DEVICES_FOR_D3D10_KHR) {
+        return CL_INVALID_VALUE;
+    }
+
+    if ((devices != nullptr && num_entries == 0) ||
+        (devices == nullptr && num_devices == nullptr)) {
+        return CL_INVALID_VALUE;
+    }
+
+    DXGI_ADAPTER_DESC adapter_desc{};
+    if (!get_d3d10_adapter_desc(d3d_device_source, d3d_object, &adapter_desc)) {
+        return CL_INVALID_D3D10_DEVICE_KHR;
+    }
+
+    static_assert(sizeof(adapter_desc.AdapterLuid) == CL_LUID_SIZE_KHR,
+                  "DXGI and OpenCL LUID sizes must match");
+
+    cl_uint matches = 0;
+    for (auto device : icd_downcast(platform)->devices()) {
+        if (!device->luid_valid() ||
+            memcmp(device->luid(), &adapter_desc.AdapterLuid,
+                   CL_LUID_SIZE_KHR) != 0) {
+            continue;
+        }
+
+        if (devices != nullptr && matches < num_entries) {
+            devices[matches] = device;
+        }
+        matches++;
+
+        if (d3d_device_set == CL_PREFERRED_DEVICES_FOR_D3D10_KHR) {
+            break;
+        }
+    }
+
+    if (num_devices != nullptr) {
+        *num_devices = matches;
+    }
+
+    return matches == 0 ? CL_DEVICE_NOT_FOUND : CL_SUCCESS;
+}
+#endif
 
 cl_int CLVK_API_CALL clGetDeviceInfo(cl_device_id dev,
                                      cl_device_info param_name,
@@ -6453,7 +6560,11 @@ cl_icd_dispatch gDispatchTable = {
     nullptr, // clEnqueueReleaseGLObjects;
     nullptr, // clGetGLContextInfoKHR;
 
+#if defined(_WIN32)
+    clGetDeviceIDsFromD3D10KHR,
+#else
     nullptr, // clGetDeviceIDsFromD3D10KHR;
+#endif
     nullptr, // clCreateFromD3D10BufferKHR;
     nullptr, // clCreateFromD3D10Texture2DKHR;
     nullptr, // clCreateFromD3D10Texture3DKHR;
