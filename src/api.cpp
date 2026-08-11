@@ -196,6 +196,90 @@ struct api_query_string : public std::string {
     size_t size_with_null() const { return size() + 1; }
 };
 
+#ifdef _WIN32
+bool valid_gl_mem_flags(cl_mem_flags flags) {
+    constexpr cl_mem_flags access =
+        CL_MEM_READ_WRITE | CL_MEM_READ_ONLY | CL_MEM_WRITE_ONLY;
+    cl_mem_flags selected = flags & access;
+    return (flags & ~access) == 0 &&
+           (selected == 0 || selected == CL_MEM_READ_WRITE ||
+            selected == CL_MEM_READ_ONLY || selected == CL_MEM_WRITE_ONLY);
+}
+
+bool gl_vulkan_format_to_cl(VkFormat format, cl_image_format* out) {
+    switch (format) {
+    case VK_FORMAT_R8_UNORM:
+        *out = {CL_R, CL_UNORM_INT8};
+        return true;
+    case VK_FORMAT_R8G8_UNORM:
+        *out = {CL_RG, CL_UNORM_INT8};
+        return true;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+        *out = {CL_RGBA, CL_UNORM_INT8};
+        return true;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        *out = {CL_BGRA, CL_UNORM_INT8};
+        return true;
+    case VK_FORMAT_R16G16B16A16_UNORM:
+        *out = {CL_RGBA, CL_UNORM_INT16};
+        return true;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        *out = {CL_RGBA, CL_HALF_FLOAT};
+        return true;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        *out = {CL_RGBA, CL_FLOAT};
+        return true;
+    case VK_FORMAT_R32G32B32A32_SINT:
+        *out = {CL_RGBA, CL_SIGNED_INT32};
+        return true;
+    case VK_FORMAT_R32G32B32A32_UINT:
+        *out = {CL_RGBA, CL_UNSIGNED_INT32};
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool gl_target_to_image_desc(cl_GLenum target,
+                             const cvk_gl_exported_object& exported,
+                             cl_image_desc* desc) {
+    memset(desc, 0, sizeof(*desc));
+    desc->image_width = exported.width;
+    desc->image_height = std::max(1u, exported.height);
+    desc->image_depth = std::max(1u, exported.depth);
+    switch (target) {
+    case 0x0DE0: // GL_TEXTURE_1D
+        desc->image_type = CL_MEM_OBJECT_IMAGE1D;
+        desc->image_height = 1;
+        desc->image_depth = 1;
+        break;
+    case 0x8C18: // GL_TEXTURE_1D_ARRAY
+        desc->image_type = CL_MEM_OBJECT_IMAGE1D_ARRAY;
+        desc->image_array_size = std::max(1u, exported.view_num_layers);
+        desc->image_height = 1;
+        desc->image_depth = 1;
+        break;
+    case 0x0DE1: // GL_TEXTURE_2D
+    case 0x84F5: // GL_TEXTURE_RECTANGLE
+        desc->image_type = CL_MEM_OBJECT_IMAGE2D;
+        desc->image_depth = 1;
+        break;
+    case 0x8C1A: // GL_TEXTURE_2D_ARRAY
+        desc->image_type = CL_MEM_OBJECT_IMAGE2D_ARRAY;
+        desc->image_array_size = std::max(1u, exported.view_num_layers);
+        desc->image_depth = 1;
+        break;
+    case 0x806F: // GL_TEXTURE_3D
+        desc->image_type = CL_MEM_OBJECT_IMAGE3D;
+        break;
+    default:
+        return false;
+    }
+    return desc->image_width != 0 && desc->image_height != 0 &&
+           desc->image_depth != 0;
+}
+#endif
+
 } // namespace
 
 // Platform API
@@ -344,6 +428,14 @@ static const std::unordered_map<std::string, void*> gExtensionEntrypoints = {
     EXTENSION_ENTRYPOINT(clReleaseSemaphoreKHR),
 #if defined(_WIN32)
     EXTENSION_ENTRYPOINT(clGetDeviceIDsFromD3D10KHR),
+    EXTENSION_ENTRYPOINT(clCreateFromGLTexture2D),
+    EXTENSION_ENTRYPOINT(clCreateFromGLTexture3D),
+    EXTENSION_ENTRYPOINT(clCreateFromGLTexture),
+    EXTENSION_ENTRYPOINT(clGetGLObjectInfo),
+    EXTENSION_ENTRYPOINT(clGetGLTextureInfo),
+    EXTENSION_ENTRYPOINT(clEnqueueAcquireGLObjects),
+    EXTENSION_ENTRYPOINT(clEnqueueReleaseGLObjects),
+    EXTENSION_ENTRYPOINT(clGetGLContextInfoKHR),
 #endif
 #undef EXTENSION_ENTRYPOINT
 #undef FUNC_PTR
@@ -4791,6 +4883,325 @@ cl_mem CLVK_API_CALL clCreateImage3D(cl_context context, cl_mem_flags flags,
     return image;
 }
 
+#ifdef _WIN32
+cl_mem CLVK_API_CALL clCreateFromGLTexture(cl_context context,
+                                           cl_mem_flags flags,
+                                           cl_GLenum texture_target,
+                                           cl_GLint miplevel, cl_GLuint texture,
+                                           cl_int* errcode_ret) {
+    TRACE_FUNCTION("context", (uintptr_t)context, "texture", texture, "target",
+                   texture_target, "miplevel", miplevel);
+    cl_int err = CL_SUCCESS;
+    cvk_image* image = nullptr;
+
+    if (!is_valid_context(context)) {
+        err = CL_INVALID_CONTEXT;
+    } else if (!valid_gl_mem_flags(flags)) {
+        err = CL_INVALID_VALUE;
+    } else if (miplevel < 0) {
+        err = CL_INVALID_MIP_LEVEL;
+    } else if (texture == 0) {
+        err = CL_INVALID_GL_OBJECT;
+    } else {
+        auto ctx = icd_downcast(context);
+        if (ctx->gl_interop() == nullptr) {
+            err = CL_INVALID_CONTEXT;
+        } else {
+            cvk_gl_exported_object exported{};
+            if (!ctx->gl_interop()->export_texture(texture_target, miplevel,
+                                                   texture, flags, &exported)) {
+                err = CL_INVALID_GL_OBJECT;
+            } else {
+                cl_image_desc desc{};
+                cl_image_format format{};
+                if (!gl_target_to_image_desc(texture_target, exported, &desc)) {
+                    err = CL_INVALID_GL_OBJECT;
+                } else if (!gl_vulkan_format_to_cl(
+                               static_cast<VkFormat>(exported.zink.format),
+                               &format)) {
+                    err = CL_IMAGE_FORMAT_NOT_SUPPORTED;
+                } else {
+                    image = cvk_image::create_from_gl(
+                        ctx, flags, &desc, &format, std::move(exported), &err);
+                    exported.win32_handle = nullptr;
+                }
+                if (image == nullptr && exported.win32_handle != nullptr) {
+                    CloseHandle(exported.win32_handle);
+                }
+            }
+        }
+    }
+
+    if (errcode_ret != nullptr) {
+        *errcode_ret = err;
+    }
+    return image;
+}
+
+cl_mem CLVK_API_CALL clCreateFromGLTexture2D(
+    cl_context context, cl_mem_flags flags, cl_GLenum texture_target,
+    cl_GLint miplevel, cl_GLuint texture, cl_int* errcode_ret) {
+    return clCreateFromGLTexture(context, flags, texture_target, miplevel,
+                                 texture, errcode_ret);
+}
+
+cl_mem CLVK_API_CALL clCreateFromGLTexture3D(
+    cl_context context, cl_mem_flags flags, cl_GLenum texture_target,
+    cl_GLint miplevel, cl_GLuint texture, cl_int* errcode_ret) {
+    return clCreateFromGLTexture(context, flags, texture_target, miplevel,
+                                 texture, errcode_ret);
+}
+
+cl_int CLVK_API_CALL clGetGLObjectInfo(cl_mem memobj,
+                                       cl_gl_object_type* gl_object_type,
+                                       cl_GLuint* gl_object_name) {
+    if (!is_valid_image(memobj)) {
+        return CL_INVALID_MEM_OBJECT;
+    }
+    auto image = static_cast<cvk_image*>(memobj);
+    if (!image->is_gl_shared()) {
+        return CL_INVALID_GL_OBJECT;
+    }
+
+    if (gl_object_name != nullptr) {
+        *gl_object_name = image->gl_export().object;
+    }
+    if (gl_object_type != nullptr) {
+        switch (image->gl_export().target) {
+        case 0x0DE0:
+        case 0x8C18:
+            *gl_object_type = CL_GL_OBJECT_TEXTURE1D;
+            break;
+        case 0x806F:
+            *gl_object_type = CL_GL_OBJECT_TEXTURE3D;
+            break;
+        default:
+            *gl_object_type = CL_GL_OBJECT_TEXTURE2D;
+            break;
+        }
+    }
+    return CL_SUCCESS;
+}
+
+cl_int CLVK_API_CALL clGetGLTextureInfo(cl_mem memobj,
+                                        cl_gl_texture_info param_name,
+                                        size_t param_value_size,
+                                        void* param_value,
+                                        size_t* param_value_size_ret) {
+    if (!is_valid_image(memobj)) {
+        return CL_INVALID_MEM_OBJECT;
+    }
+    auto image = static_cast<cvk_image*>(memobj);
+    if (!image->is_gl_shared()) {
+        return CL_INVALID_GL_OBJECT;
+    }
+
+    const void* value = nullptr;
+    size_t size = 0;
+    cl_GLenum target;
+    cl_GLint miplevel;
+    if (param_name == CL_GL_TEXTURE_TARGET) {
+        target = image->gl_export().target;
+        value = &target;
+        size = sizeof(target);
+    } else if (param_name == CL_GL_MIPMAP_LEVEL) {
+        miplevel = image->gl_export().miplevel;
+        value = &miplevel;
+        size = sizeof(miplevel);
+    } else {
+        return CL_INVALID_VALUE;
+    }
+
+    if (param_value != nullptr) {
+        if (param_value_size < size) {
+            return CL_INVALID_VALUE;
+        }
+        memcpy(param_value, value, size);
+    }
+    if (param_value_size_ret != nullptr) {
+        *param_value_size_ret = size;
+    }
+    return CL_SUCCESS;
+}
+
+cl_int cvk_enqueue_gl_objects(cl_command_queue command_queue,
+                              cl_uint num_objects, const cl_mem* mem_objects,
+                              bool acquire, cl_uint num_events_in_wait_list,
+                              const cl_event* event_wait_list,
+                              cl_event* event) {
+    if (!is_valid_command_queue(command_queue)) {
+        return CL_INVALID_COMMAND_QUEUE;
+    }
+    if (num_objects == 0 || mem_objects == nullptr) {
+        return CL_INVALID_VALUE;
+    }
+    if (!is_valid_event_wait_list(num_events_in_wait_list, event_wait_list)) {
+        return CL_INVALID_EVENT_WAIT_LIST;
+    }
+
+    auto queue = icd_downcast(command_queue);
+    if (!is_same_context(queue, num_events_in_wait_list, event_wait_list)) {
+        return CL_INVALID_CONTEXT;
+    }
+
+    std::vector<cvk_image*> images;
+    std::unordered_set<cvk_image*> unique;
+    images.reserve(num_objects);
+    for (cl_uint i = 0; i < num_objects; i++) {
+        if (!is_valid_image(mem_objects[i])) {
+            return CL_INVALID_MEM_OBJECT;
+        }
+        auto image = static_cast<cvk_image*>(mem_objects[i]);
+        if (!image->is_gl_shared() || !is_same_context(queue, image)) {
+            return CL_INVALID_GL_OBJECT;
+        }
+        if (!unique.insert(image).second ||
+            image->is_gl_acquired() != !acquire) {
+            return CL_INVALID_OPERATION;
+        }
+        images.push_back(image);
+    }
+
+    if (acquire) {
+        std::vector<cvk_gl_exported_object*> exported;
+        exported.reserve(images.size());
+        for (auto* image : images) {
+            exported.push_back(&image->gl_export());
+        }
+        auto interop = queue->context()->gl_interop();
+        if (interop == nullptr || !interop->flush_objects(exported)) {
+            return CL_INVALID_GL_OBJECT;
+        }
+    }
+
+    size_t marked = 0;
+    for (; marked < images.size(); marked++) {
+        bool changed = acquire ? images[marked]->mark_gl_acquired()
+                               : images[marked]->mark_gl_released();
+        if (!changed) {
+            break;
+        }
+    }
+    if (marked != images.size()) {
+        while (marked > 0) {
+            --marked;
+            if (acquire) {
+                images[marked]->mark_gl_released();
+            } else {
+                images[marked]->mark_gl_acquired();
+            }
+        }
+        return CL_INVALID_OPERATION;
+    }
+
+    auto cmd = new cvk_command_gl_objects(queue, acquire, images);
+    cl_int err = queue->enqueue_command_with_deps(cmd, num_events_in_wait_list,
+                                                  event_wait_list, event);
+    if (err != CL_SUCCESS) {
+        for (auto* image : images) {
+            if (acquire) {
+                image->mark_gl_released();
+            } else {
+                image->mark_gl_acquired();
+            }
+        }
+    }
+    return err;
+}
+
+cl_int CLVK_API_CALL clEnqueueAcquireGLObjects(cl_command_queue command_queue,
+                                               cl_uint num_objects,
+                                               const cl_mem* mem_objects,
+                                               cl_uint num_events_in_wait_list,
+                                               const cl_event* event_wait_list,
+                                               cl_event* event) {
+    return cvk_enqueue_gl_objects(command_queue, num_objects, mem_objects, true,
+                                  num_events_in_wait_list, event_wait_list,
+                                  event);
+}
+
+cl_int CLVK_API_CALL clEnqueueReleaseGLObjects(cl_command_queue command_queue,
+                                               cl_uint num_objects,
+                                               const cl_mem* mem_objects,
+                                               cl_uint num_events_in_wait_list,
+                                               const cl_event* event_wait_list,
+                                               cl_event* event) {
+    return cvk_enqueue_gl_objects(command_queue, num_objects, mem_objects,
+                                  false, num_events_in_wait_list,
+                                  event_wait_list, event);
+}
+
+cl_int CLVK_API_CALL clGetGLContextInfoKHR(
+    const cl_context_properties* properties, cl_gl_context_info param_name,
+    size_t param_value_size, void* param_value, size_t* param_value_size_ret) {
+    if (properties == nullptr) {
+        return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
+    }
+
+    HGLRC gl_context = nullptr;
+    HDC gl_dc = nullptr;
+    cl_platform_id platform = nullptr;
+    std::unordered_set<cl_context_properties> seen;
+    for (const cl_context_properties* prop = properties; *prop != 0;
+         prop += 2) {
+        if (!seen.insert(prop[0]).second) {
+            return CL_INVALID_PROPERTY;
+        }
+        switch (prop[0]) {
+        case CL_GL_CONTEXT_KHR:
+            gl_context = reinterpret_cast<HGLRC>(prop[1]);
+            break;
+        case CL_WGL_HDC_KHR:
+            gl_dc = reinterpret_cast<HDC>(prop[1]);
+            break;
+        case CL_CONTEXT_PLATFORM:
+            platform = reinterpret_cast<cl_platform_id>(prop[1]);
+            break;
+        default:
+            return CL_INVALID_PROPERTY;
+        }
+    }
+    auto state = get_or_init_global_state();
+    if (!gl_context || !gl_dc ||
+        (platform != nullptr &&
+         (!is_valid_platform(platform) || platform != state->platform()))) {
+        return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
+    }
+
+    cvk_gl_interop interop(gl_context, gl_dc);
+    if (!interop.init()) {
+        return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
+    }
+    cl_device_id matching = nullptr;
+    for (auto* device : state->platform()->devices()) {
+        if (memcmp(device->uuid(), interop.device_info().uuid.data(),
+                   CL_UUID_SIZE_KHR) == 0) {
+            matching = device;
+            break;
+        }
+    }
+    if (matching == nullptr) {
+        return CL_DEVICE_NOT_FOUND;
+    }
+    if (param_name != CL_CURRENT_DEVICE_FOR_GL_CONTEXT_KHR &&
+        param_name != CL_DEVICES_FOR_GL_CONTEXT_KHR) {
+        return CL_INVALID_VALUE;
+    }
+
+    size_t size = sizeof(matching);
+    if (param_value != nullptr) {
+        if (param_value_size < size) {
+            return CL_INVALID_VALUE;
+        }
+        memcpy(param_value, &matching, size);
+    }
+    if (param_value_size_ret != nullptr) {
+        *param_value_size_ret = size;
+    }
+    return CL_SUCCESS;
+}
+#endif
+
 cl_int CLVK_API_CALL clGetImageInfo(cl_mem image, cl_image_info param_name,
                                     size_t param_value_size, void* param_value,
                                     size_t* param_value_size_ret) {
@@ -6551,6 +6962,16 @@ cl_icd_dispatch gDispatchTable = {
     clEnqueueBarrier,
     clGetExtensionFunctionAddress,
     nullptr, // clCreateFromGLBuffer;
+#if defined(_WIN32)
+    clCreateFromGLTexture2D,
+    clCreateFromGLTexture3D,
+    nullptr, // clCreateFromGLRenderbuffer;
+    clGetGLObjectInfo,
+    clGetGLTextureInfo,
+    clEnqueueAcquireGLObjects,
+    clEnqueueReleaseGLObjects,
+    clGetGLContextInfoKHR,
+#else
     nullptr, // clCreateFromGLTexture2D;
     nullptr, // clCreateFromGLTexture3D;
     nullptr, // clCreateFromGLRenderbuffer;
@@ -6559,6 +6980,7 @@ cl_icd_dispatch gDispatchTable = {
     nullptr, // clEnqueueAcquireGLObjects;
     nullptr, // clEnqueueReleaseGLObjects;
     nullptr, // clGetGLContextInfoKHR;
+#endif
 
 #if defined(_WIN32)
     clGetDeviceIDsFromD3D10KHR,
@@ -6605,7 +7027,11 @@ cl_icd_dispatch gDispatchTable = {
     clEnqueueMarkerWithWaitList,
     clEnqueueBarrierWithWaitList,
     clGetExtensionFunctionAddressForPlatform,
+#if defined(_WIN32)
+    clCreateFromGLTexture,
+#else
     nullptr, // clCreateFromGLTexture;
+#endif
 
     /* cl_khr_d3d11_sharing */
     nullptr, // clGetDeviceIDsFromD3D11KHR;

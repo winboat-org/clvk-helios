@@ -19,6 +19,9 @@
 
 #include "device.hpp"
 #include "event.hpp"
+#ifdef _WIN32
+#include "gl_sharing.hpp"
+#endif
 #include "objects.hpp"
 #include "utils.hpp"
 
@@ -53,6 +56,32 @@ struct cvk_memory_allocation {
 
         return vkAllocateMemory(m_device, &memoryAllocateInfo, 0, &m_memory);
     }
+
+#ifdef _WIN32
+    VkResult allocate_imported_win32(HANDLE handle, VkImage image) {
+        const VkImportMemoryWin32HandleInfoKHR importInfo = {
+            VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+            nullptr,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+            handle,
+            nullptr,
+        };
+        const VkMemoryDedicatedAllocateInfo dedicatedInfo = {
+            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            &importInfo,
+            image,
+            VK_NULL_HANDLE,
+        };
+        const VkMemoryAllocateInfo memoryAllocateInfo = {
+            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            &dedicatedInfo,
+            m_size,
+            m_memory_type_index,
+        };
+        return vkAllocateMemory(m_device, &memoryAllocateInfo, nullptr,
+                                &m_memory);
+    }
+#endif
 
     void invalidate(VkDeviceSize offset, VkDeviceSize size) {
         if (!m_coherent) {
@@ -586,7 +615,12 @@ struct cvk_image : public cvk_mem {
                   desc->image_type),
           m_desc(*desc), m_format(*format), m_image(VK_NULL_HANDLE),
           m_sampled_view(VK_NULL_HANDLE), m_storage_view(VK_NULL_HANDLE),
-          m_buffer_view(VK_NULL_HANDLE) {
+          m_buffer_view(VK_NULL_HANDLE)
+#ifdef _WIN32
+          ,
+          m_gl_shared(false), m_gl_acquired(false)
+#endif
+    {
         // All images require asynchronous initialiation for the initial
         // layout transition (and copy/use host ptr init) apart from
         // those backed by a texel buffer
@@ -599,9 +633,6 @@ struct cvk_image : public cvk_mem {
 
     ~cvk_image() {
         auto vkdev = m_context->device()->vulkan_device();
-        if (m_image != VK_NULL_HANDLE) {
-            vkDestroyImage(vkdev, m_image, nullptr);
-        }
         if (m_sampled_view != VK_NULL_HANDLE) {
             vkDestroyImageView(vkdev, m_sampled_view, nullptr);
         }
@@ -610,6 +641,9 @@ struct cvk_image : public cvk_mem {
         }
         if (m_buffer_view != VK_NULL_HANDLE) {
             vkDestroyBufferView(vkdev, m_buffer_view, nullptr);
+        }
+        if (m_image != VK_NULL_HANDLE) {
+            vkDestroyImage(vkdev, m_image, nullptr);
         }
         if (buffer() != nullptr) {
             buffer()->release();
@@ -639,6 +673,27 @@ struct cvk_image : public cvk_mem {
                              const cl_image_format* format, void* host_ptr,
                              std::vector<cl_mem_properties>&& properties,
                              cl_int* errcode_ret);
+
+#ifdef _WIN32
+    static cvk_image* create_from_gl(cvk_context* ctx, cl_mem_flags flags,
+                                     const cl_image_desc* desc,
+                                     const cl_image_format* format,
+                                     cvk_gl_exported_object&& exported,
+                                     cl_int* errcode_ret);
+
+    bool is_gl_shared() const { return m_gl_shared; }
+    const cvk_gl_exported_object& gl_export() const { return m_gl_export; }
+    cvk_gl_exported_object& gl_export() { return m_gl_export; }
+    bool mark_gl_acquired() {
+        bool expected = false;
+        return m_gl_acquired.compare_exchange_strong(expected, true);
+    }
+    bool mark_gl_released() {
+        bool expected = true;
+        return m_gl_acquired.compare_exchange_strong(expected, false);
+    }
+    bool is_gl_acquired() const { return m_gl_acquired.load(); }
+#endif
 
     bool is_backed_by_buffer_view() const {
         return type() == CL_MEM_OBJECT_IMAGE1D_BUFFER;
@@ -832,6 +887,9 @@ struct cvk_image : public cvk_mem {
 
 private:
     cl_int init_vulkan_image();
+#ifdef _WIN32
+    cl_int init_vulkan_gl_image();
+#endif
     cl_int init_vulkan_texel_buffer();
     cl_int init();
 
@@ -890,4 +948,9 @@ private:
     std::unordered_map<void*, std::list<cvk_image_mapping>> m_mappings;
     std::mutex m_mappings_lock;
     std::unique_ptr<cvk_buffer> m_init_data;
+#ifdef _WIN32
+    bool m_gl_shared;
+    std::atomic_bool m_gl_acquired;
+    cvk_gl_exported_object m_gl_export{};
+#endif
 };

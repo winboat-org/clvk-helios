@@ -60,6 +60,7 @@ add_library(OpenCL-objects OBJECT
   device.cpp
   device_properties.cpp
   event.cpp
+  gl_sharing.cpp
   image_format.cpp
   init.cpp
   kernel.cpp

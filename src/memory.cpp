@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cmath>
 
 #include "image_format.hpp"
@@ -322,6 +323,179 @@ cvk_image* cvk_image::create(cvk_context* ctx, cl_mem_flags flags,
     *errcode_ret = image->init();
     return *errcode_ret == CL_SUCCESS ? image.release() : nullptr;
 }
+
+#ifdef _WIN32
+cvk_image* cvk_image::create_from_gl(cvk_context* ctx, cl_mem_flags flags,
+                                     const cl_image_desc* desc,
+                                     const cl_image_format* format,
+                                     cvk_gl_exported_object&& exported,
+                                     cl_int* errcode_ret) {
+    std::vector<cl_mem_properties> properties;
+    auto image = std::make_unique<cvk_image>(ctx, flags, desc, format, nullptr,
+                                             std::move(properties));
+    image->m_gl_shared = true;
+    image->m_gl_export = std::move(exported);
+    image->m_size = image->m_gl_export.zink.allocation_size;
+    *errcode_ret = image->init_vulkan_gl_image();
+    if (*errcode_ret != CL_SUCCESS) {
+        if (image->m_gl_export.win32_handle != nullptr) {
+            CloseHandle(image->m_gl_export.win32_handle);
+            image->m_gl_export.win32_handle = nullptr;
+        }
+        return nullptr;
+    }
+    image->m_init_tracker.set_state(cvk_mem_init_state::completed);
+    return image.release();
+}
+
+cl_int cvk_image::init_vulkan_gl_image() {
+    auto device = m_context->device();
+    auto vkdev = device->vulkan_device();
+    const auto& shared = m_gl_export.zink;
+
+    if (shared.object_type != 1 ||
+        shared.handle_type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+        shared.memory_offset != 0 || m_gl_export.win32_handle == nullptr) {
+        return CL_INVALID_GL_OBJECT;
+    }
+
+    const VkExternalMemoryImageCreateInfo externalInfo = {
+        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        nullptr,
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+    };
+    const VkImageCreateInfo imageInfo = {
+        VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        &externalInfo,
+        static_cast<VkImageCreateFlags>(shared.create_flags),
+        static_cast<VkImageType>(shared.image_type),
+        static_cast<VkFormat>(shared.format),
+        {shared.width, shared.height, shared.depth},
+        shared.mip_levels,
+        shared.array_layers,
+        static_cast<VkSampleCountFlagBits>(shared.samples),
+        static_cast<VkImageTiling>(shared.tiling),
+        static_cast<VkImageUsageFlags>(shared.usage),
+        static_cast<VkSharingMode>(shared.sharing_mode),
+        0,
+        nullptr,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    VkResult result = vkCreateImage(vkdev, &imageInfo, nullptr, &m_image);
+    if (result != VK_SUCCESS) {
+        cvk_error_fn("could not create the imported GL image (%d)", result);
+        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    }
+
+    VkMemoryRequirements requirements;
+    vkGetImageMemoryRequirements(vkdev, m_image, &requirements);
+    VkMemoryWin32HandlePropertiesKHR handleProperties = {
+        VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
+        nullptr,
+        0,
+    };
+    result = vkGetMemoryWin32HandlePropertiesKHR(
+        vkdev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+        m_gl_export.win32_handle, &handleProperties);
+    if (result != VK_SUCCESS) {
+        cvk_error_fn("could not query imported GL memory properties (%d)",
+                     result);
+        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    }
+
+    uint32_t memory_bits =
+        requirements.memoryTypeBits & handleProperties.memoryTypeBits;
+    uint32_t memory_type = device->memory_type_index_for_image(memory_bits);
+    if (memory_type == VK_MAX_MEMORY_TYPES ||
+        shared.allocation_size < requirements.size) {
+        cvk_error_fn("imported GL memory is incompatible with the alias image");
+        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    }
+
+    m_memory = std::make_shared<cvk_memory_allocation>(
+        vkdev, shared.allocation_size, memory_type,
+        device->memory_index_is_coherent(memory_type), false);
+    result =
+        m_memory->allocate_imported_win32(m_gl_export.win32_handle, m_image);
+    CloseHandle(m_gl_export.win32_handle);
+    m_gl_export.win32_handle = nullptr;
+    if (result != VK_SUCCESS) {
+        cvk_error_fn("could not import GL memory (%d)", result);
+        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    }
+
+    result = vkBindImageMemory(vkdev, m_image, m_memory->vulkan_memory(), 0);
+    if (result != VK_SUCCESS) {
+        cvk_error_fn("could not bind imported GL memory (%d)", result);
+        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    }
+
+    VkImageViewType view_type;
+    switch (m_gl_export.target) {
+    case 0x0DE0: // GL_TEXTURE_1D
+        view_type = VK_IMAGE_VIEW_TYPE_1D;
+        break;
+    case 0x8C18: // GL_TEXTURE_1D_ARRAY
+        view_type = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+        break;
+    case 0x806F: // GL_TEXTURE_3D
+        view_type = VK_IMAGE_VIEW_TYPE_3D;
+        break;
+    case 0x8C1A: // GL_TEXTURE_2D_ARRAY
+        view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        break;
+    case 0x8513: // GL_TEXTURE_CUBE_MAP
+        view_type = VK_IMAGE_VIEW_TYPE_CUBE;
+        break;
+    default:
+        view_type = VK_IMAGE_VIEW_TYPE_2D;
+        break;
+    }
+
+    const VkImageSubresourceRange subresource = {
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        m_gl_export.view_min_level +
+            static_cast<uint32_t>(m_gl_export.miplevel),
+        1,
+        m_gl_export.view_min_layer,
+        std::max(1u, m_gl_export.view_num_layers),
+    };
+    VkImageViewCreateInfo viewInfo = {
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        nullptr,
+        0,
+        m_image,
+        view_type,
+        static_cast<VkFormat>(shared.format),
+        {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+         VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+        subresource,
+    };
+
+    if (shared.usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
+        result = vkCreateImageView(vkdev, &viewInfo, nullptr, &m_sampled_view);
+        if (result != VK_SUCCESS) {
+            return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+        }
+    }
+    if (shared.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
+        result = vkCreateImageView(vkdev, &viewInfo, nullptr, &m_storage_view);
+        if (result != VK_SUCCESS) {
+            return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+        }
+    }
+
+    bool needs_sampled = flags() & CL_MEM_READ_ONLY;
+    bool needs_storage = !(flags() & CL_MEM_READ_ONLY);
+    if ((needs_sampled && m_sampled_view == VK_NULL_HANDLE) ||
+        (needs_storage && m_storage_view == VK_NULL_HANDLE)) {
+        cvk_error_fn("GL image lacks the Vulkan usage required by OpenCL");
+        return CL_INVALID_OPERATION;
+    }
+    return CL_SUCCESS;
+}
+#endif
 
 cl_int cvk_image::init_vulkan_image() {
     // Translate image type and size

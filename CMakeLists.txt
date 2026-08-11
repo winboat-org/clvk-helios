@@ -52,7 +52,7 @@ if (CLVK_ENABLE_UBSAN)
 endif()
 
 if(WIN32)
-  add_compile_definitions(NOMINMAX)
+  add_compile_definitions(NOMINMAX VK_USE_PLATFORM_WIN32_KHR)
 endif()
 
 # Options

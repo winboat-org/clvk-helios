@@ -254,6 +254,9 @@ bool cvk_device::init_extensions() {
         VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
         VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME,
+#ifdef _WIN32
+        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+#endif
     };
 
     if (m_properties.apiVersion < VK_MAKE_VERSION(1, 2, 0)) {
@@ -647,6 +650,13 @@ void cvk_device::build_extension_ils_list() {
         m_extensions.push_back(
             MAKE_NAME_VERSION(1, 0, 0, "cl_khr_pci_bus_info"));
     }
+
+#ifdef _WIN32
+    if (is_vulkan_extension_enabled(
+            VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME)) {
+        m_extensions.push_back(MAKE_NAME_VERSION(1, 0, 0, "cl_khr_gl_sharing"));
+    }
+#endif
 
     if ((m_properties.apiVersion >= VK_MAKE_VERSION(1, 3, 0) ||
          is_vulkan_extension_enabled(

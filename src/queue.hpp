@@ -1130,3 +1130,34 @@ struct cvk_command_image_init final : public cvk_command_batchable {
 private:
     cvk_image_holder m_image;
 };
+
+#ifdef _WIN32
+struct cvk_command_gl_objects final : public cvk_command_batchable {
+    cvk_command_gl_objects(cvk_command_queue* queue, bool acquire,
+                           const std::vector<cvk_image*>& images)
+        : cvk_command_batchable(acquire ? CL_COMMAND_ACQUIRE_GL_OBJECTS
+                                        : CL_COMMAND_RELEASE_GL_OBJECTS,
+                                queue),
+          m_acquire(acquire) {
+        for (auto* image : images) {
+            m_images.emplace_back(image);
+        }
+    }
+
+    const std::vector<cvk_mem*> memory_objects() const override {
+        std::vector<cvk_mem*> objects;
+        objects.reserve(m_images.size());
+        for (const auto& image : m_images) {
+            objects.push_back(image);
+        }
+        return objects;
+    }
+
+    CHECK_RETURN cl_int
+    build_batchable_inner(cvk_command_buffer& cmdbuf) override final;
+
+private:
+    bool m_acquire;
+    std::vector<cvk_image_holder> m_images;
+};
+#endif

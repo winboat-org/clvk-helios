@@ -1877,3 +1877,72 @@ cvk_command_image_init::build_batchable_inner(cvk_command_buffer& cmdbuf) {
 
     return CL_SUCCESS;
 }
+
+#ifdef _WIN32
+cl_int
+cvk_command_gl_objects::build_batchable_inner(cvk_command_buffer& cmdbuf) {
+    std::vector<VkImageMemoryBarrier> barriers;
+    barriers.reserve(m_images.size());
+    uint32_t queue_family = m_queue->vulkan_queue().queue_family();
+
+    for (const auto& image : m_images) {
+        const auto& exported = image->gl_export();
+        uint32_t src_queue;
+        uint32_t dst_queue;
+        VkImageLayout old_layout;
+        VkImageLayout new_layout;
+        VkAccessFlags src_access;
+        VkAccessFlags dst_access;
+
+        if (m_acquire) {
+            src_queue = exported.zink.released_queue_family;
+            dst_queue = queue_family;
+            if (src_queue == VK_QUEUE_FAMILY_IGNORED) {
+                dst_queue = VK_QUEUE_FAMILY_IGNORED;
+            } else if (src_queue != VK_QUEUE_FAMILY_EXTERNAL) {
+                cvk_error_fn("GL image was not released to an external queue");
+                return CL_INVALID_OPERATION;
+            }
+            old_layout = static_cast<VkImageLayout>(exported.zink.layout);
+            new_layout = VK_IMAGE_LAYOUT_GENERAL;
+            src_access = 0;
+            dst_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        } else {
+            src_queue = queue_family;
+            dst_queue = VK_QUEUE_FAMILY_EXTERNAL;
+            old_layout = VK_IMAGE_LAYOUT_GENERAL;
+            new_layout = static_cast<VkImageLayout>(exported.zink.layout);
+            if (new_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                new_layout = VK_IMAGE_LAYOUT_GENERAL;
+            }
+            src_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            dst_access = 0;
+        }
+
+        barriers.push_back({
+            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            nullptr,
+            src_access,
+            dst_access,
+            old_layout,
+            new_layout,
+            src_queue,
+            dst_queue,
+            image->vulkan_image(),
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, exported.zink.mip_levels, 0,
+             exported.zink.array_layers},
+        });
+    }
+
+    VkPipelineStageFlags src_stage = m_acquire
+                                         ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                                         : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkPipelineStageFlags dst_stage = m_acquire
+                                         ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT
+                                         : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    vkCmdPipelineBarrier(cmdbuf, src_stage, dst_stage, 0, 0, nullptr, 0,
+                         nullptr, static_cast<uint32_t>(barriers.size()),
+                         barriers.data());
+    return CL_SUCCESS;
+}
+#endif

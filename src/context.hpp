@@ -14,7 +14,12 @@
 
 #pragma once
 
+#include <cstring>
+
 #include "device.hpp"
+#ifdef _WIN32
+#include "gl_sharing.hpp"
+#endif
 #include "objects.hpp"
 #include "unit.hpp"
 
@@ -63,6 +68,10 @@ struct cvk_context : public _cl_context,
 
     cl_int init() {
         std::unordered_set<cl_context_properties> seen;
+#ifdef _WIN32
+        HGLRC gl_context = nullptr;
+        HDC gl_device_context = nullptr;
+#endif
         for (unsigned i = 0; i < m_properties.size(); i += 2) {
             auto property = m_properties[i];
             if (seen.count(property) > 0) {
@@ -85,12 +94,39 @@ struct cvk_context : public _cl_context,
             case CL_PRINTF_CALLBACK_ARM:
                 m_printf_callback = (cvk_printf_callback_t)m_properties[i + 1];
                 break;
+#ifdef _WIN32
+            case CL_GL_CONTEXT_KHR:
+                gl_context = reinterpret_cast<HGLRC>(m_properties[i + 1]);
+                break;
+            case CL_WGL_HDC_KHR:
+                gl_device_context = reinterpret_cast<HDC>(m_properties[i + 1]);
+                break;
+#endif
             case 0:
                 break;
             default:
                 return CL_INVALID_PROPERTY;
             }
         }
+#ifdef _WIN32
+        if ((gl_context == nullptr) != (gl_device_context == nullptr)) {
+            return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
+        }
+        if (gl_context != nullptr) {
+            if (!m_device->is_vulkan_extension_enabled(
+                    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME)) {
+                return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
+            }
+            m_gl_interop =
+                std::make_unique<cvk_gl_interop>(gl_context, gl_device_context);
+            if (!m_gl_interop->init() ||
+                memcmp(m_gl_interop->device_info().uuid.data(),
+                       m_device->uuid(), CL_UUID_SIZE_KHR) != 0) {
+                m_gl_interop.reset();
+                return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
+            }
+        }
+#endif
         return CL_SUCCESS;
     }
 
@@ -99,6 +135,9 @@ struct cvk_context : public _cl_context,
     }
 
     cvk_device* device() const { return m_device; }
+#ifdef _WIN32
+    cvk_gl_interop* gl_interop() const { return m_gl_interop.get(); }
+#endif
     unsigned num_devices() const { return 1u; }
     bool has_device(const cvk_device* device) const {
         return device == m_device;
@@ -149,6 +188,9 @@ private:
 
     std::mutex m_queue_image_init_lock;
     cvk_command_queue* m_queue_image_init = nullptr;
+#ifdef _WIN32
+    std::unique_ptr<cvk_gl_interop> m_gl_interop;
+#endif
 };
 
 static inline cvk_context* icd_downcast(cl_context context) {
