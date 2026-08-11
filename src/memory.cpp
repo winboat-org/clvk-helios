@@ -391,8 +391,7 @@ cl_int cvk_image::init_vulkan_gl_image() {
     VkMemoryRequirements requirements;
     vkGetImageMemoryRequirements(vkdev, m_image, &requirements);
     if (shared.memory_type_index >= VK_MAX_MEMORY_TYPES ||
-        !(requirements.memoryTypeBits &
-          (1u << shared.memory_type_index)) ||
+        !(requirements.memoryTypeBits & (1u << shared.memory_type_index)) ||
         shared.allocation_size < requirements.size) {
         cvk_error_fn("imported GL memory is incompatible with the alias image");
         return CL_MEM_OBJECT_ALLOCATION_FAILURE;

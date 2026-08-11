@@ -575,9 +575,8 @@ TEST_F(WithCommandQueue, UnmapUseHostPtrCopiesBeforeReturning) {
     static const size_t BUFFER_SIZE = NUM_ELEMS * sizeof(cl_uint);
 
     std::vector<cl_uint> host(NUM_ELEMS, 0);
-    auto buffer =
-        CreateBuffer(CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, BUFFER_SIZE,
-                     host.data());
+    auto buffer = CreateBuffer(CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
+                               BUFFER_SIZE, host.data());
 
     auto data = EnqueueMapBuffer<cl_uint>(buffer, CL_TRUE, CL_MAP_WRITE, 0,
                                           BUFFER_SIZE);
@@ -609,12 +608,11 @@ TEST_F(WithCommandQueue, UnmapReadOnlyMappingDoesNotWriteBack) {
     for (size_t i = 0; i < NUM_ELEMS; i++) {
         host[i] = static_cast<cl_uint>(i);
     }
-    auto buffer =
-        CreateBuffer(CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, BUFFER_SIZE,
-                     host.data());
+    auto buffer = CreateBuffer(CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
+                               BUFFER_SIZE, host.data());
 
-    auto data = EnqueueMapBuffer<cl_uint>(buffer, CL_TRUE, CL_MAP_READ, 0,
-                                          BUFFER_SIZE);
+    auto data =
+        EnqueueMapBuffer<cl_uint>(buffer, CL_TRUE, CL_MAP_READ, 0, BUFFER_SIZE);
     ASSERT_EQ(data[0], 0u);
     EnqueueUnmapMemObject(buffer, data);
 
