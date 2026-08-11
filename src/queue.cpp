@@ -1503,12 +1503,48 @@ cl_int cvk_command_map_buffer::do_action() {
     return success ? CL_COMPLETE : CL_OUT_OF_RESOURCES;
 }
 
+cl_int cvk_command_unmap_buffer::complete_host_handoff() {
+    if (m_host_handoff_done) {
+        return CL_SUCCESS;
+    }
+
+    if (!m_buffer->has_flags(CL_MEM_USE_HOST_PTR)) {
+        m_host_handoff_done = true;
+        return CL_SUCCESS;
+    }
+
+    auto mapping = m_buffer->mapping_for(m_mapped_ptr);
+
+    // A read-only mapping cannot have host modifications to propagate. The
+    // image unmap path already makes this distinction; the buffer path used to
+    // copy unconditionally.
+    const bool needs_copy =
+        (mapping.flags & (CL_MAP_WRITE | CL_MAP_WRITE_INVALIDATE_REGION)) != 0;
+    if (!needs_copy) {
+        m_host_handoff_done = true;
+        return CL_SUCCESS;
+    }
+
+    auto src = pointer_offset(m_buffer->host_ptr(), mapping.offset);
+    if (!mapping.buffer->copy_from(src, mapping.offset, mapping.size)) {
+        return CL_OUT_OF_RESOURCES;
+    }
+
+    m_host_handoff_done = true;
+    return CL_SUCCESS;
+}
+
 cl_int cvk_command_unmap_buffer::do_action() {
     bool success = true;
 
     auto mapping = m_buffer->remove_mapping(m_mapped_ptr);
 
-    if (m_buffer->has_flags(CL_MEM_USE_HOST_PTR)) {
+    // The copy out of application-owned memory normally happens in
+    // complete_host_handoff(), on the thread that enqueued this command, while
+    // that memory is still guaranteed to be alive. Keep the original path for
+    // any caller that has not done the handoff, so no case silently loses the
+    // write-back.
+    if (!m_host_handoff_done && m_buffer->has_flags(CL_MEM_USE_HOST_PTR)) {
         auto src = m_buffer->host_ptr();
         src = pointer_offset(src, mapping.offset);
         success = mapping.buffer->copy_from(src, mapping.offset, mapping.size);

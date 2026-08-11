@@ -971,16 +971,30 @@ struct cvk_command_unmap_buffer final : public cvk_command_buffer_base {
     cvk_command_unmap_buffer(cvk_command_queue* queue, cvk_buffer* buffer,
                              void* map_ptr)
         : cvk_command_buffer_base(queue, CL_COMMAND_UNMAP_MEM_OBJECT, buffer),
-          m_mapped_ptr(map_ptr) {}
+          m_mapped_ptr(map_ptr), m_host_handoff_done(false) {}
 
     const std::vector<cvk_mem*> memory_objects() const override {
         return {m_buffer};
     }
 
+    // Copies a CL_MEM_USE_HOST_PTR mapping's contents out of the application's
+    // memory and into the backing buffer, and records that do_action() must
+    // not repeat it.
+    //
+    // This runs on the thread calling clEnqueueUnmapMemObject rather than on
+    // the executor thread. The application only guarantees that the memory it
+    // handed to CL_MEM_USE_HOST_PTR is alive while it still owns the mapping;
+    // once the enqueue call returns it may release the mem object and free
+    // that memory, and reading it later from the executor thread is a
+    // use-after-free. Performing the copy here cannot be observed out of
+    // order, because no command may access a region while it is mapped.
+    CHECK_RETURN cl_int complete_host_handoff();
+
 private:
     CHECK_RETURN cl_int do_action() override final;
 
     void* m_mapped_ptr;
+    bool m_host_handoff_done;
 };
 
 struct cvk_command_dep : public cvk_command {

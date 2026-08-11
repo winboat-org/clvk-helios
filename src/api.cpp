@@ -4252,10 +4252,16 @@ cl_int CLVK_API_CALL clEnqueueUnmapMemObject(cl_command_queue cq, cl_mem mem,
         auto image = static_cast<cvk_image*>(memobj);
         if (image->is_backed_by_buffer_view()) {
             auto buffer = static_cast<cvk_buffer*>(image->buffer());
-            auto cmd =
-                new cvk_command_unmap_buffer(command_queue, buffer, mapped_ptr);
+            auto cmd = std::make_unique<cvk_command_unmap_buffer>(
+                command_queue, buffer, mapped_ptr);
+            // Read the application's memory while it is still guaranteed to
+            // be alive; see cvk_command_unmap_buffer::complete_host_handoff.
+            auto err = cmd->complete_host_handoff();
+            if (err != CL_SUCCESS) {
+                return err;
+            }
             return command_queue->enqueue_command_with_deps(
-                cmd, num_events_in_wait_list, event_wait_list, event);
+                cmd.release(), num_events_in_wait_list, event_wait_list, event);
         } else {
             return cvk_enqueue_unmap_image(command_queue, image, mapped_ptr,
                                            true, false, num_events_in_wait_list,
@@ -4265,6 +4271,10 @@ cl_int CLVK_API_CALL clEnqueueUnmapMemObject(cl_command_queue cq, cl_mem mem,
         auto buffer = static_cast<cvk_buffer*>(memobj);
         auto cmd = std::make_unique<cvk_command_unmap_buffer>(
             command_queue, buffer, mapped_ptr);
+        auto err = cmd->complete_host_handoff();
+        if (err != CL_SUCCESS) {
+            return err;
+        }
         return command_queue->enqueue_command_with_deps(
             cmd.release(), num_events_in_wait_list, event_wait_list, event);
     }

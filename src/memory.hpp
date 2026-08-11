@@ -494,6 +494,15 @@ struct cvk_buffer : public cvk_mem {
         return true;
     }
 
+    // Non-destructive lookup, mirroring cvk_image::mapping_for. Needed to
+    // inspect a mapping's direction and extent on the enqueueing thread,
+    // before the command that removes it runs.
+    cvk_buffer_mapping mapping_for(void* ptr) {
+        std::lock_guard<std::mutex> lock(m_mappings_lock);
+        CVK_ASSERT(m_mappings.count(ptr) > 0);
+        return m_mappings.at(ptr);
+    }
+
     cvk_buffer_mapping remove_mapping(void* ptr) {
         std::lock_guard<std::mutex> lock(m_mappings_lock);
         CVK_ASSERT(m_mappings.count(ptr) > 0);

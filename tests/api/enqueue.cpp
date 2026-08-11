@@ -14,9 +14,11 @@
 
 #include "testcl.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 TEST_F(WithCommandQueue, ManyInstancesInFlight) {
 
@@ -563,3 +565,66 @@ TEST_F(WithCommandQueue, VkEndCommandBufferError) {
     ASSERT_EQ(err, CL_OUT_OF_RESOURCES);
 }
 #endif
+
+// The application only guarantees that CL_MEM_USE_HOST_PTR memory is alive
+// while it still owns the mapping. Once clEnqueueUnmapMemObject returns it may
+// reuse or free that memory, so the write-back must have happened by then
+// rather than later on the executor thread.
+TEST_F(WithCommandQueue, UnmapUseHostPtrCopiesBeforeReturning) {
+    static const size_t NUM_ELEMS = 1024;
+    static const size_t BUFFER_SIZE = NUM_ELEMS * sizeof(cl_uint);
+
+    std::vector<cl_uint> host(NUM_ELEMS, 0);
+    auto buffer =
+        CreateBuffer(CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, BUFFER_SIZE,
+                     host.data());
+
+    auto data = EnqueueMapBuffer<cl_uint>(buffer, CL_TRUE, CL_MAP_WRITE, 0,
+                                          BUFFER_SIZE);
+    for (size_t i = 0; i < NUM_ELEMS; i++) {
+        data[i] = static_cast<cl_uint>(i);
+    }
+    EnqueueUnmapMemObject(buffer, data);
+
+    // Stand in for the application releasing or reusing its own memory as soon
+    // as the enqueue call returns.
+    std::fill(host.begin(), host.end(), 0xdeadbeefu);
+
+    Finish();
+
+    std::vector<cl_uint> readback(NUM_ELEMS, 0);
+    EnqueueReadBuffer(buffer, CL_TRUE, 0, BUFFER_SIZE, readback.data());
+    for (size_t i = 0; i < NUM_ELEMS; i++) {
+        ASSERT_EQ(readback[i], static_cast<cl_uint>(i));
+    }
+}
+
+// A read-only mapping has no host modifications to propagate, so unmapping it
+// must not copy the host memory into the buffer at all.
+TEST_F(WithCommandQueue, UnmapReadOnlyMappingDoesNotWriteBack) {
+    static const size_t NUM_ELEMS = 1024;
+    static const size_t BUFFER_SIZE = NUM_ELEMS * sizeof(cl_uint);
+
+    std::vector<cl_uint> host(NUM_ELEMS);
+    for (size_t i = 0; i < NUM_ELEMS; i++) {
+        host[i] = static_cast<cl_uint>(i);
+    }
+    auto buffer =
+        CreateBuffer(CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, BUFFER_SIZE,
+                     host.data());
+
+    auto data = EnqueueMapBuffer<cl_uint>(buffer, CL_TRUE, CL_MAP_READ, 0,
+                                          BUFFER_SIZE);
+    ASSERT_EQ(data[0], 0u);
+    EnqueueUnmapMemObject(buffer, data);
+
+    std::fill(host.begin(), host.end(), 0xdeadbeefu);
+
+    Finish();
+
+    std::vector<cl_uint> readback(NUM_ELEMS, 0);
+    EnqueueReadBuffer(buffer, CL_TRUE, 0, BUFFER_SIZE, readback.data());
+    for (size_t i = 0; i < NUM_ELEMS; i++) {
+        ASSERT_EQ(readback[i], static_cast<cl_uint>(i));
+    }
+}
