@@ -226,7 +226,7 @@ bool cvk_gl_interop::export_object(cl_GLenum target, cl_GLint miplevel,
     }
     if (result.out_driver_data_written < sizeof(driver_info) ||
         driver_info.magic != CVK_ZINK_GL_INTEROP_MAGIC ||
-        driver_info.version != 1 ||
+        driver_info.version != 2 ||
         driver_info.struct_size < sizeof(driver_info)) {
         cvk_warn_fn("Mesa GL interop export of object %u produced no valid "
                     "Zink metadata",

@@ -390,41 +390,17 @@ cl_int cvk_image::init_vulkan_gl_image() {
 
     VkMemoryRequirements requirements;
     vkGetImageMemoryRequirements(vkdev, m_image, &requirements);
-    VkMemoryWin32HandlePropertiesKHR handleProperties = {
-        VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR,
-        nullptr,
-        0,
-    };
-    auto getMemoryWin32HandleProperties =
-        reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
-            vkGetDeviceProcAddr(vkdev,
-                                "vkGetMemoryWin32HandlePropertiesKHR"));
-    if (getMemoryWin32HandleProperties == nullptr) {
-        cvk_error_fn(
-            "could not load vkGetMemoryWin32HandlePropertiesKHR");
-        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
-    }
-    result = getMemoryWin32HandleProperties(
-        vkdev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-        m_gl_export.win32_handle, &handleProperties);
-    if (result != VK_SUCCESS) {
-        cvk_error_fn("could not query imported GL memory properties (%d)",
-                     result);
-        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
-    }
-
-    uint32_t memory_bits =
-        requirements.memoryTypeBits & handleProperties.memoryTypeBits;
-    uint32_t memory_type = device->memory_type_index_for_image(memory_bits);
-    if (memory_type == VK_MAX_MEMORY_TYPES ||
+    if (shared.memory_type_index >= VK_MAX_MEMORY_TYPES ||
+        !(requirements.memoryTypeBits &
+          (1u << shared.memory_type_index)) ||
         shared.allocation_size < requirements.size) {
         cvk_error_fn("imported GL memory is incompatible with the alias image");
         return CL_MEM_OBJECT_ALLOCATION_FAILURE;
     }
 
     m_memory = std::make_shared<cvk_memory_allocation>(
-        vkdev, shared.allocation_size, memory_type,
-        device->memory_index_is_coherent(memory_type), false);
+        vkdev, shared.allocation_size, shared.memory_type_index,
+        device->memory_index_is_coherent(shared.memory_type_index), false);
     result =
         m_memory->allocate_imported_win32(m_gl_export.win32_handle, m_image);
     CloseHandle(m_gl_export.win32_handle);

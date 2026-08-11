@@ -70,7 +70,7 @@ struct cvk_zink_glinterop_export_info {
     uint32_t sharing_mode;
     uint32_t layout;
     uint32_t released_queue_family;
-    uint32_t reserved;
+    uint32_t memory_type_index;
     uint64_t allocation_size;
     uint64_t memory_offset;
 };
