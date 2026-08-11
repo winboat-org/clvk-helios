@@ -395,7 +395,16 @@ cl_int cvk_image::init_vulkan_gl_image() {
         nullptr,
         0,
     };
-    result = vkGetMemoryWin32HandlePropertiesKHR(
+    auto getMemoryWin32HandleProperties =
+        reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
+            vkGetDeviceProcAddr(vkdev,
+                                "vkGetMemoryWin32HandlePropertiesKHR"));
+    if (getMemoryWin32HandleProperties == nullptr) {
+        cvk_error_fn(
+            "could not load vkGetMemoryWin32HandlePropertiesKHR");
+        return CL_MEM_OBJECT_ALLOCATION_FAILURE;
+    }
+    result = getMemoryWin32HandleProperties(
         vkdev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
         m_gl_export.win32_handle, &handleProperties);
     if (result != VK_SUCCESS) {
