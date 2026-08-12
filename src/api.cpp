@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include "cl_headers.hpp"
+#ifdef _WIN32
+#include "d3d11_sharing.hpp"
+#endif
 #include "icd.hpp"
 #include "image_format.hpp"
 #include "init.hpp"
@@ -24,6 +27,8 @@
 #include "queue.hpp"
 #include "semaphore.hpp"
 #include "tracing.hpp"
+
+#include <type_traits>
 
 #define LOG_API_CALL(fmt, ...)                                                 \
     cvk_debug_group_fn(loggroup::api, fmt, __VA_ARGS__)
@@ -197,7 +202,7 @@ struct api_query_string : public std::string {
 };
 
 #ifdef _WIN32
-bool valid_gl_mem_flags(cl_mem_flags flags) {
+bool valid_interop_mem_flags(cl_mem_flags flags) {
     constexpr cl_mem_flags access =
         CL_MEM_READ_WRITE | CL_MEM_READ_ONLY | CL_MEM_WRITE_ONLY;
     cl_mem_flags selected = flags & access;
@@ -414,7 +419,9 @@ cl_int CLVK_API_CALL clGetPlatformInfo(cl_platform_id platform,
 static const std::unordered_map<std::string, void*> gExtensionEntrypoints = {
 #define FUNC_PTR(X) reinterpret_cast<void*>(X)
 #define EXTENSION_ENTRYPOINT(X)                                                \
-    { #X, FUNC_PTR(X) }
+    {                                                                          \
+#X, FUNC_PTR(X)                                                        \
+    }
     EXTENSION_ENTRYPOINT(clCreateProgramWithILKHR),
     EXTENSION_ENTRYPOINT(clIcdGetPlatformIDsKHR),
     EXTENSION_ENTRYPOINT(clCreateCommandQueueWithPropertiesKHR),
@@ -428,6 +435,12 @@ static const std::unordered_map<std::string, void*> gExtensionEntrypoints = {
     EXTENSION_ENTRYPOINT(clReleaseSemaphoreKHR),
 #if defined(_WIN32)
     EXTENSION_ENTRYPOINT(clGetDeviceIDsFromD3D10KHR),
+    EXTENSION_ENTRYPOINT(clGetDeviceIDsFromD3D11KHR),
+    EXTENSION_ENTRYPOINT(clCreateFromD3D11BufferKHR),
+    EXTENSION_ENTRYPOINT(clCreateFromD3D11Texture2DKHR),
+    EXTENSION_ENTRYPOINT(clCreateFromD3D11Texture3DKHR),
+    EXTENSION_ENTRYPOINT(clEnqueueAcquireD3D11ObjectsKHR),
+    EXTENSION_ENTRYPOINT(clEnqueueReleaseD3D11ObjectsKHR),
     EXTENSION_ENTRYPOINT(clCreateFromGLTexture2D),
     EXTENSION_ENTRYPOINT(clCreateFromGLTexture3D),
     EXTENSION_ENTRYPOINT(clCreateFromGLTexture),
@@ -597,6 +610,71 @@ cl_int CLVK_API_CALL clGetDeviceIDsFromD3D10KHR(
         *num_devices = matches;
     }
 
+    return matches == 0 ? CL_DEVICE_NOT_FOUND : CL_SUCCESS;
+}
+
+cl_int CLVK_API_CALL clGetDeviceIDsFromD3D11KHR(
+    cl_platform_id platform, cl_d3d11_device_source_khr d3d_device_source,
+    void* d3d_object, cl_d3d11_device_set_khr d3d_device_set,
+    cl_uint num_entries, cl_device_id* devices, cl_uint* num_devices) {
+    auto state = get_or_init_global_state();
+
+    TRACE_FUNCTION("platform", (uintptr_t)platform, "d3d_device_source",
+                   d3d_device_source, "d3d_device_set", d3d_device_set,
+                   "num_entries", num_entries);
+    LOG_API_CALL("platform = %p, d3d_device_source = %u, d3d_object = %p, "
+                 "d3d_device_set = %u, num_entries = %u, devices = %p, "
+                 "num_devices = %p",
+                 platform, d3d_device_source, d3d_object, d3d_device_set,
+                 num_entries, devices, num_devices);
+
+    if (platform != state->platform()) {
+        return CL_INVALID_PLATFORM;
+    }
+    if (d3d_device_source != CL_D3D11_DEVICE_KHR &&
+        d3d_device_source != CL_D3D11_DXGI_ADAPTER_KHR) {
+        return CL_INVALID_VALUE;
+    }
+    if (d3d_device_set != CL_PREFERRED_DEVICES_FOR_D3D11_KHR &&
+        d3d_device_set != CL_ALL_DEVICES_FOR_D3D11_KHR) {
+        return CL_INVALID_VALUE;
+    }
+    if ((devices != nullptr && num_entries == 0) ||
+        (devices == nullptr && num_devices == nullptr)) {
+        return CL_INVALID_VALUE;
+    }
+
+    DXGI_ADAPTER_DESC adapter_desc{};
+    if (!cvk_get_d3d11_adapter_desc(d3d_device_source, d3d_object,
+                                    &adapter_desc)) {
+        return CL_INVALID_D3D11_DEVICE_KHR;
+    }
+
+    static_assert(sizeof(adapter_desc.AdapterLuid) == CL_LUID_SIZE_KHR,
+                  "DXGI and OpenCL LUID sizes must match");
+
+    cl_uint matches = 0;
+    for (auto* device : icd_downcast(platform)->devices()) {
+        // The staging-copy fallback lets any clvk device interoperate. A
+        // device is preferred only when it is the same physical adapter.
+        if (d3d_device_set == CL_PREFERRED_DEVICES_FOR_D3D11_KHR &&
+            (!device->luid_valid() ||
+             memcmp(device->luid(), &adapter_desc.AdapterLuid,
+                    CL_LUID_SIZE_KHR) != 0)) {
+            continue;
+        }
+        if (devices != nullptr && matches < num_entries) {
+            devices[matches] = device;
+        }
+        matches++;
+        if (d3d_device_set == CL_PREFERRED_DEVICES_FOR_D3D11_KHR) {
+            break;
+        }
+    }
+
+    if (num_devices != nullptr) {
+        *num_devices = matches;
+    }
     return matches == 0 ? CL_DEVICE_NOT_FOUND : CL_SUCCESS;
 }
 #endif
@@ -1366,6 +1444,7 @@ cl_int CLVK_API_CALL clGetContextInfo(cl_context ctx,
     size_t size_ret = 0;
     const void* copy_ptr = nullptr;
     cl_uint val_uint;
+    cl_bool val_bool;
     cl_device_id val_device;
 
     if (!is_valid_context(ctx)) {
@@ -1400,6 +1479,13 @@ cl_int CLVK_API_CALL clGetContextInfo(cl_context ctx,
                 context->properties().size() * sizeof(cl_context_properties);
         }
         break;
+#ifdef _WIN32
+    case CL_CONTEXT_D3D11_PREFER_SHARED_RESOURCES_KHR:
+        val_bool = CL_FALSE;
+        copy_ptr = &val_bool;
+        size_ret = sizeof(val_bool);
+        break;
+#endif
     default:
         ret = CL_INVALID_VALUE;
         break;
@@ -2308,6 +2394,9 @@ cl_int CLVK_API_CALL clGetMemObjectInfo(cl_mem mem, cl_mem_info param_name,
     cl_mem val_memobj;
     void* val_ptr;
     cl_bool val_bool;
+#ifdef _WIN32
+    ID3D11Resource* val_d3d11_resource;
+#endif
 
     auto memobj = icd_downcast(mem);
 
@@ -2378,6 +2467,16 @@ cl_int CLVK_API_CALL clGetMemObjectInfo(cl_mem mem, cl_mem_info param_name,
         copy_ptr = memobj->properties().data();
         ret_size = memobj->properties().size() * sizeof(cl_mem_properties);
         break;
+#ifdef _WIN32
+    case CL_MEM_D3D11_RESOURCE_KHR:
+        if (!memobj->is_d3d11_shared()) {
+            return CL_INVALID_D3D11_RESOURCE_KHR;
+        }
+        val_d3d11_resource = memobj->d3d11_shared()->resource();
+        copy_ptr = &val_d3d11_resource;
+        ret_size = sizeof(val_d3d11_resource);
+        break;
+#endif
     default:
         ret = CL_INVALID_VALUE;
     }
@@ -4894,6 +4993,236 @@ cl_mem CLVK_API_CALL clCreateImage3D(cl_context context, cl_mem_flags flags,
 }
 
 #ifdef _WIN32
+cl_mem CLVK_API_CALL clCreateFromD3D11BufferKHR(cl_context context,
+                                                cl_mem_flags flags,
+                                                ID3D11Buffer* resource,
+                                                cl_int* errcode_ret) {
+    TRACE_FUNCTION("context", (uintptr_t)context, "flags", flags, "resource",
+                   (uintptr_t)resource);
+    LOG_API_CALL("context = %p, flags = %lu, resource = %p, errcode_ret = %p",
+                 context, flags, resource, errcode_ret);
+
+    cl_int err = CL_SUCCESS;
+    cvk_buffer* buffer = nullptr;
+    if (!is_valid_context(context)) {
+        err = CL_INVALID_CONTEXT;
+    } else if (!valid_interop_mem_flags(flags)) {
+        err = CL_INVALID_VALUE;
+    } else {
+        auto* ctx = icd_downcast(context);
+        if (ctx->d3d11_interop() == nullptr) {
+            err = CL_INVALID_CONTEXT;
+        } else {
+            auto shared = cvk_d3d11_shared_resource::create_buffer(
+                ctx->d3d11_interop(), resource, &err);
+            if (shared != nullptr) {
+                auto created = cvk_buffer::create(ctx, flags, shared->size(),
+                                                  nullptr, &err);
+                if (created != nullptr) {
+                    created->set_d3d11_shared(std::move(shared));
+                    buffer = created.release();
+                }
+            }
+        }
+    }
+
+    if (errcode_ret != nullptr) {
+        *errcode_ret = err;
+    }
+    return buffer;
+}
+
+namespace {
+
+template <typename Texture>
+cl_mem create_from_d3d11_texture(cl_context context, cl_mem_flags flags,
+                                 Texture* resource, UINT subresource,
+                                 cl_int* errcode_ret) {
+    cl_int err = CL_SUCCESS;
+    cvk_image* image = nullptr;
+    if (!is_valid_context(context)) {
+        err = CL_INVALID_CONTEXT;
+    } else if (!valid_interop_mem_flags(flags)) {
+        err = CL_INVALID_VALUE;
+    } else {
+        auto* ctx = icd_downcast(context);
+        if (ctx->d3d11_interop() == nullptr) {
+            err = CL_INVALID_CONTEXT;
+        } else {
+            cl_image_desc desc{};
+            cl_image_format format{};
+            std::shared_ptr<cvk_d3d11_shared_resource> shared;
+            if constexpr (std::is_same_v<Texture, ID3D11Texture2D>) {
+                shared = cvk_d3d11_shared_resource::create_texture2d(
+                    ctx->d3d11_interop(), resource, subresource, &desc, &format,
+                    &err);
+            } else {
+                shared = cvk_d3d11_shared_resource::create_texture3d(
+                    ctx->d3d11_interop(), resource, subresource, &desc, &format,
+                    &err);
+            }
+            if (shared != nullptr) {
+                std::vector<cl_mem_properties> properties;
+                image = cvk_image::create(ctx, flags, &desc, &format, nullptr,
+                                          std::move(properties), &err);
+                if (err == CL_IMAGE_FORMAT_NOT_SUPPORTED) {
+                    err = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
+                }
+                if (image != nullptr) {
+                    image->set_d3d11_shared(std::move(shared));
+                }
+            }
+        }
+    }
+
+    if (errcode_ret != nullptr) {
+        *errcode_ret = err;
+    }
+    return image;
+}
+
+} // namespace
+
+cl_mem CLVK_API_CALL clCreateFromD3D11Texture2DKHR(cl_context context,
+                                                   cl_mem_flags flags,
+                                                   ID3D11Texture2D* resource,
+                                                   UINT subresource,
+                                                   cl_int* errcode_ret) {
+    TRACE_FUNCTION("context", (uintptr_t)context, "flags", flags, "resource",
+                   (uintptr_t)resource, "subresource", subresource);
+    LOG_API_CALL("context = %p, flags = %lu, resource = %p, subresource = %u, "
+                 "errcode_ret = %p",
+                 context, flags, resource, subresource, errcode_ret);
+    return create_from_d3d11_texture(context, flags, resource, subresource,
+                                     errcode_ret);
+}
+
+cl_mem CLVK_API_CALL clCreateFromD3D11Texture3DKHR(cl_context context,
+                                                   cl_mem_flags flags,
+                                                   ID3D11Texture3D* resource,
+                                                   UINT subresource,
+                                                   cl_int* errcode_ret) {
+    TRACE_FUNCTION("context", (uintptr_t)context, "flags", flags, "resource",
+                   (uintptr_t)resource, "subresource", subresource);
+    LOG_API_CALL("context = %p, flags = %lu, resource = %p, subresource = %u, "
+                 "errcode_ret = %p",
+                 context, flags, resource, subresource, errcode_ret);
+    return create_from_d3d11_texture(context, flags, resource, subresource,
+                                     errcode_ret);
+}
+
+namespace {
+
+cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
+                             cl_uint num_objects, const cl_mem* mem_objects,
+                             bool acquire, cl_uint num_events_in_wait_list,
+                             const cl_event* event_wait_list, cl_event* event) {
+    if (!is_valid_command_queue(command_queue)) {
+        return CL_INVALID_COMMAND_QUEUE;
+    }
+    if (num_objects == 0 && mem_objects == nullptr) {
+        return CL_SUCCESS;
+    }
+    if (num_objects == 0 || mem_objects == nullptr) {
+        return CL_INVALID_VALUE;
+    }
+    if (!is_valid_event_wait_list(num_events_in_wait_list, event_wait_list)) {
+        return CL_INVALID_EVENT_WAIT_LIST;
+    }
+
+    auto* queue = icd_downcast(command_queue);
+    if (queue->context()->d3d11_interop() == nullptr ||
+        !is_same_context(queue, num_events_in_wait_list, event_wait_list)) {
+        return CL_INVALID_CONTEXT;
+    }
+
+    std::vector<cvk_mem*> objects;
+    objects.reserve(num_objects);
+    for (cl_uint i = 0; i < num_objects; i++) {
+        if (!is_valid_mem_object(mem_objects[i]) ||
+            !icd_downcast(mem_objects[i])->is_d3d11_shared()) {
+            return CL_INVALID_MEM_OBJECT;
+        }
+        auto* object = icd_downcast(mem_objects[i]);
+        if (!is_same_context(queue, object)) {
+            return CL_INVALID_CONTEXT;
+        }
+        objects.push_back(object);
+    }
+
+    size_t transitioned = 0;
+    for (; transitioned < objects.size(); transitioned++) {
+        auto& shared = objects[transitioned]->d3d11_shared();
+        bool changed =
+            acquire ? shared->begin_acquire() : shared->begin_release();
+        if (!changed) {
+            break;
+        }
+    }
+    if (transitioned != objects.size()) {
+        while (transitioned > 0) {
+            --transitioned;
+            auto& shared = objects[transitioned]->d3d11_shared();
+            if (acquire) {
+                shared->finish_acquire(false);
+            } else {
+                shared->finish_release(false);
+            }
+        }
+        return acquire ? CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR
+                       : CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR;
+    }
+
+    auto* command = new cvk_command_d3d11_objects(queue, acquire, objects);
+    cl_int result = queue->enqueue_command_with_deps(
+        command, num_events_in_wait_list, event_wait_list, event);
+    for (auto* object : objects) {
+        auto& shared = object->d3d11_shared();
+        if (acquire) {
+            shared->finish_acquire(result == CL_SUCCESS);
+        } else {
+            shared->finish_release(result == CL_SUCCESS);
+        }
+    }
+    return result;
+}
+
+} // namespace
+
+cl_int CLVK_API_CALL clEnqueueAcquireD3D11ObjectsKHR(
+    cl_command_queue command_queue, cl_uint num_objects,
+    const cl_mem* mem_objects, cl_uint num_events_in_wait_list,
+    const cl_event* event_wait_list, cl_event* event) {
+    TRACE_FUNCTION("command_queue", (uintptr_t)command_queue, "num_objects",
+                   num_objects, "num_events_in_wait_list",
+                   num_events_in_wait_list);
+    LOG_API_CALL("command_queue = %p, num_objects = %u, mem_objects = %p, "
+                 "num_events_in_wait_list = %u, event_wait_list = %p, "
+                 "event = %p",
+                 command_queue, num_objects, mem_objects,
+                 num_events_in_wait_list, event_wait_list, event);
+    return enqueue_d3d11_objects(command_queue, num_objects, mem_objects, true,
+                                 num_events_in_wait_list, event_wait_list,
+                                 event);
+}
+
+cl_int CLVK_API_CALL clEnqueueReleaseD3D11ObjectsKHR(
+    cl_command_queue command_queue, cl_uint num_objects,
+    const cl_mem* mem_objects, cl_uint num_events_in_wait_list,
+    const cl_event* event_wait_list, cl_event* event) {
+    TRACE_FUNCTION("command_queue", (uintptr_t)command_queue, "num_objects",
+                   num_objects, "num_events_in_wait_list",
+                   num_events_in_wait_list);
+    LOG_API_CALL("command_queue = %p, num_objects = %u, mem_objects = %p, "
+                 "num_events_in_wait_list = %u, event_wait_list = %p, "
+                 "event = %p",
+                 command_queue, num_objects, mem_objects,
+                 num_events_in_wait_list, event_wait_list, event);
+    return enqueue_d3d11_objects(command_queue, num_objects, mem_objects, false,
+                                 num_events_in_wait_list, event_wait_list,
+                                 event);
+}
+
 cl_mem CLVK_API_CALL clCreateFromGLTexture(cl_context context,
                                            cl_mem_flags flags,
                                            cl_GLenum texture_target,
@@ -4906,7 +5235,7 @@ cl_mem CLVK_API_CALL clCreateFromGLTexture(cl_context context,
 
     if (!is_valid_context(context)) {
         err = CL_INVALID_CONTEXT;
-    } else if (!valid_gl_mem_flags(flags)) {
+    } else if (!valid_interop_mem_flags(flags)) {
         err = CL_INVALID_VALUE;
     } else if (miplevel < 0) {
         err = CL_INVALID_MIP_LEVEL;
@@ -5291,6 +5620,16 @@ cl_int CLVK_API_CALL clGetImageInfo(cl_mem image, cl_image_info param_name,
         copy_ptr = &val_uint;
         ret_size = sizeof(val_uint);
         break;
+#ifdef _WIN32
+    case CL_IMAGE_D3D11_SUBRESOURCE_KHR:
+        if (!img->is_d3d11_shared()) {
+            return CL_INVALID_D3D11_RESOURCE_KHR;
+        }
+        val_uint = img->d3d11_shared()->subresource();
+        copy_ptr = &val_uint;
+        ret_size = sizeof(val_uint);
+        break;
+#endif
     default:
         ret = CL_INVALID_VALUE;
     }
@@ -7044,13 +7383,25 @@ cl_icd_dispatch gDispatchTable = {
 #endif
 
     /* cl_khr_d3d11_sharing */
+#if defined(_WIN32)
+    clGetDeviceIDsFromD3D11KHR,
+    clCreateFromD3D11BufferKHR,
+    clCreateFromD3D11Texture2DKHR,
+    clCreateFromD3D11Texture3DKHR,
+#else
     nullptr, // clGetDeviceIDsFromD3D11KHR;
     nullptr, // clCreateFromD3D11BufferKHR;
     nullptr, // clCreateFromD3D11Texture2DKHR;
     nullptr, // clCreateFromD3D11Texture3DKHR;
+#endif
     nullptr, // clCreateFromDX9MediaSurfaceKHR;
+#if defined(_WIN32)
+    clEnqueueAcquireD3D11ObjectsKHR,
+    clEnqueueReleaseD3D11ObjectsKHR,
+#else
     nullptr, // clEnqueueAcquireD3D11ObjectsKHR;
     nullptr, // clEnqueueReleaseD3D11ObjectsKHR;
+#endif
 
     /* cl_khr_dx9_media_sharing */
     nullptr, // clGetDeviceIDsFromDX9MediaAdapterKHR;

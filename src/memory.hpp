@@ -25,6 +25,10 @@
 #include "objects.hpp"
 #include "utils.hpp"
 
+#ifdef _WIN32
+class cvk_d3d11_shared_resource;
+#endif
+
 struct cvk_memory_allocation {
 
     // |budget_device| is the device this allocation is charged to, or nullptr
@@ -366,6 +370,16 @@ struct cvk_mem : public _cl_mem, api_object<object_magic::memory_object> {
 
     void invalidate_memory(VkDeviceSize offset, VkDeviceSize size);
 
+#ifdef _WIN32
+    void set_d3d11_shared(std::shared_ptr<cvk_d3d11_shared_resource> shared) {
+        m_d3d11_shared = std::move(shared);
+    }
+    bool is_d3d11_shared() const { return m_d3d11_shared != nullptr; }
+    const std::shared_ptr<cvk_d3d11_shared_resource>& d3d11_shared() const {
+        return m_d3d11_shared;
+    }
+#endif
+
 private:
     bool CHECK_RETURN map_memory();
     void unmap_memory();
@@ -387,6 +401,9 @@ protected:
     size_t m_parent_offset;
     std::shared_ptr<cvk_memory_allocation> m_memory;
     cvk_mem_init_tracker m_init_tracker{};
+#ifdef _WIN32
+    std::shared_ptr<cvk_d3d11_shared_resource> m_d3d11_shared;
+#endif
 };
 
 static inline cvk_mem* icd_downcast(cl_mem mem) {

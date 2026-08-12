@@ -18,6 +18,7 @@
 
 #include "device.hpp"
 #ifdef _WIN32
+#include "d3d11_sharing.hpp"
 #include "gl_sharing.hpp"
 #endif
 #include "objects.hpp"
@@ -43,7 +44,7 @@ struct cvk_context : public _cl_context,
     cvk_context(cvk_device* device, const cl_context_properties* props,
                 void* user_data)
         : m_device(device), m_printf_buffersize(0), m_printf_callback(nullptr),
-          m_user_data(user_data) {
+          m_user_data(user_data), m_interop_user_sync(false) {
 
         if (props) {
             while (*props) {
@@ -71,6 +72,8 @@ struct cvk_context : public _cl_context,
 #ifdef _WIN32
         HGLRC gl_context = nullptr;
         HDC gl_device_context = nullptr;
+        ID3D11Device* d3d11_device = nullptr;
+        bool has_d3d11_device = false;
 #endif
         for (unsigned i = 0; i < m_properties.size(); i += 2) {
             auto property = m_properties[i];
@@ -94,12 +97,24 @@ struct cvk_context : public _cl_context,
             case CL_PRINTF_CALLBACK_ARM:
                 m_printf_callback = (cvk_printf_callback_t)m_properties[i + 1];
                 break;
+            case CL_CONTEXT_INTEROP_USER_SYNC:
+                if (m_properties[i + 1] != CL_FALSE &&
+                    m_properties[i + 1] != CL_TRUE) {
+                    return CL_INVALID_PROPERTY;
+                }
+                m_interop_user_sync = m_properties[i + 1] == CL_TRUE;
+                break;
 #ifdef _WIN32
             case CL_GL_CONTEXT_KHR:
                 gl_context = reinterpret_cast<HGLRC>(m_properties[i + 1]);
                 break;
             case CL_WGL_HDC_KHR:
                 gl_device_context = reinterpret_cast<HDC>(m_properties[i + 1]);
+                break;
+            case CL_CONTEXT_D3D11_DEVICE_KHR:
+                has_d3d11_device = true;
+                d3d11_device =
+                    reinterpret_cast<ID3D11Device*>(m_properties[i + 1]);
                 break;
 #endif
             case 0:
@@ -126,6 +141,14 @@ struct cvk_context : public _cl_context,
                 return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
             }
         }
+        if (has_d3d11_device) {
+            m_d3d11_interop = std::make_unique<cvk_d3d11_interop>();
+            cl_int result = m_d3d11_interop->init(d3d11_device);
+            if (result != CL_SUCCESS) {
+                m_d3d11_interop.reset();
+                return result;
+            }
+        }
 #endif
         return CL_SUCCESS;
     }
@@ -137,7 +160,9 @@ struct cvk_context : public _cl_context,
     cvk_device* device() const { return m_device; }
 #ifdef _WIN32
     cvk_gl_interop* gl_interop() const { return m_gl_interop.get(); }
+    cvk_d3d11_interop* d3d11_interop() const { return m_d3d11_interop.get(); }
 #endif
+    bool interop_user_sync() const { return m_interop_user_sync; }
     unsigned num_devices() const { return 1u; }
     bool has_device(const cvk_device* device) const {
         return device == m_device;
@@ -185,11 +210,13 @@ private:
     size_t m_printf_buffersize;
     cvk_printf_callback_t m_printf_callback;
     void* m_user_data;
+    bool m_interop_user_sync;
 
     std::mutex m_queue_image_init_lock;
     cvk_command_queue* m_queue_image_init = nullptr;
 #ifdef _WIN32
     std::unique_ptr<cvk_gl_interop> m_gl_interop;
+    std::unique_ptr<cvk_d3d11_interop> m_d3d11_interop;
 #endif
 };
 

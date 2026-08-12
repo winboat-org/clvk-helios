@@ -1146,6 +1146,34 @@ private:
 };
 
 #ifdef _WIN32
+struct cvk_command_d3d11_objects final : public cvk_command {
+    cvk_command_d3d11_objects(cvk_command_queue* queue, bool acquire,
+                              const std::vector<cvk_mem*>& objects)
+        : cvk_command(acquire ? CL_COMMAND_ACQUIRE_D3D11_OBJECTS_KHR
+                              : CL_COMMAND_RELEASE_D3D11_OBJECTS_KHR,
+                      queue),
+          m_acquire(acquire) {
+        for (auto* object : objects) {
+            m_objects.emplace_back(object);
+        }
+    }
+
+    const std::vector<cvk_mem*> memory_objects() const override {
+        std::vector<cvk_mem*> objects;
+        objects.reserve(m_objects.size());
+        for (const auto& object : m_objects) {
+            objects.push_back(object);
+        }
+        return objects;
+    }
+
+private:
+    CHECK_RETURN cl_int do_action() override final;
+
+    bool m_acquire;
+    std::vector<cvk_mem_holder> m_objects;
+};
+
 struct cvk_command_gl_objects final : public cvk_command_batchable {
     cvk_command_gl_objects(cvk_command_queue* queue, bool acquire,
                            const std::vector<cvk_image*>& images)

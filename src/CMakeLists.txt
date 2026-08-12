@@ -57,6 +57,7 @@ add_library(OpenCL-objects OBJECT
   api.cpp
   config.cpp
   context.cpp
+  d3d11_sharing.cpp
   device.cpp
   device_properties.cpp
   event.cpp

@@ -30,6 +30,11 @@ add_gtest_executable(api_tests
     workgroup.cpp
 )
 
+if (WIN32)
+  target_sources(api_tests PRIVATE d3d11.cpp)
+  target_link_libraries(api_tests d3d11 dxgi)
+endif()
+
 target_include_directories(api_tests SYSTEM BEFORE PRIVATE
     ${SPIRV_HEADERS_SOURCE_DIR}/include
 )
@@ -37,4 +42,3 @@ target_include_directories(api_tests SYSTEM BEFORE PRIVATE
 if (${CLVK_VULKAN_IMPLEMENTATION} STREQUAL swiftshader)
   add_definitions(-DUSING_SWIFTSHADER)
 endif()
-

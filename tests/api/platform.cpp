@@ -48,11 +48,21 @@ TEST(Platform, DeviceQueryWithMultipleTypes) {
     }
 }
 
-TEST(Platform, InvalidContext) {
+TEST(Platform, InteropUserSyncContextProperty) {
     cl_int err;
-    const cl_context_properties properties[] = {CL_CONTEXT_INTEROP_USER_SYNC, 0,
-                                                0};
-    clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &err);
+    const cl_context_properties valid_properties[] = {
+        CL_CONTEXT_INTEROP_USER_SYNC, CL_FALSE, 0};
+    auto context =
+        clCreateContext(valid_properties, 1, &gDevice, nullptr, nullptr, &err);
+    ASSERT_CL_SUCCESS(err);
+    ASSERT_NE(context, nullptr);
+    ASSERT_CL_SUCCESS(clReleaseContext(context));
+
+    const cl_context_properties invalid_properties[] = {
+        CL_CONTEXT_INTEROP_USER_SYNC, 2, 0};
+    context = clCreateContext(invalid_properties, 1, &gDevice, nullptr, nullptr,
+                              &err);
+    EXPECT_EQ(context, nullptr);
     ASSERT_EQ(err, CL_INVALID_PROPERTY);
 }
 

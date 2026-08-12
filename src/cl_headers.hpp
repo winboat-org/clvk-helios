@@ -18,6 +18,9 @@
 #define CL_USE_DEPRECATED_OPENCL_1_0_APIS
 #define CL_USE_DEPRECATED_OPENCL_1_1_APIS
 #include "CL/cl.h"
+#ifdef _WIN32
+#include "CL/cl_d3d11.h"
+#endif
 #include "CL/cl_ext.h"
 #include "CL/cl_gl.h"
 #include "CL/cl_half.h"

@@ -652,6 +652,10 @@ void cvk_device::build_extension_ils_list() {
     }
 
 #ifdef _WIN32
+    // D3D11 sharing has a staging-copy fallback and therefore does not depend
+    // on Vulkan external-memory support or adapter identity.
+    m_extensions.push_back(
+        MAKE_NAME_VERSION(1, 0, 0, CL_KHR_D3D11_SHARING_EXTENSION_NAME));
     if (is_vulkan_extension_enabled(
             VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME)) {
         m_extensions.push_back(MAKE_NAME_VERSION(1, 0, 0, "cl_khr_gl_sharing"));
