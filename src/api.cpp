@@ -28,6 +28,7 @@
 #include "semaphore.hpp"
 #include "tracing.hpp"
 
+#include <mutex>
 #include <new>
 #include <type_traits>
 
@@ -5153,6 +5154,12 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
         return CL_INVALID_CONTEXT;
     }
 
+    // Ownership transitions can span multiple objects and must be rolled back
+    // as one reservation if validation or enqueue fails. Serialize only this
+    // short host-side reservation window; command execution remains parallel.
+    static std::mutex reservation_mutex;
+    std::lock_guard<std::mutex> reservation_lock(reservation_mutex);
+
     std::vector<cvk_mem*> objects;
     try {
         objects.reserve(num_objects);
@@ -5185,9 +5192,9 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
             --transitioned;
             auto& shared = objects[transitioned]->d3d11_shared();
             if (acquire) {
-                shared->finish_acquire(false);
+                shared->cancel_acquire();
             } else {
-                shared->finish_release(false);
+                shared->cancel_release();
             }
         }
         return acquire ? CL_D3D11_RESOURCE_ALREADY_ACQUIRED_KHR
@@ -5201,9 +5208,9 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
         for (auto* object : objects) {
             auto& shared = object->d3d11_shared();
             if (acquire) {
-                shared->finish_acquire(false);
+                shared->cancel_acquire();
             } else {
-                shared->finish_release(false);
+                shared->cancel_release();
             }
         }
         return CL_OUT_OF_HOST_MEMORY;
@@ -5214,9 +5221,9 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
         for (auto* object : objects) {
             auto& shared = object->d3d11_shared();
             if (acquire) {
-                shared->finish_acquire(false);
+                shared->cancel_acquire();
             } else {
-                shared->finish_release(false);
+                shared->cancel_release();
             }
         }
     }

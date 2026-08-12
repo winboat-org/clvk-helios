@@ -89,6 +89,8 @@ public:
 
     bool begin_acquire();
     bool begin_release();
+    void cancel_acquire();
+    void cancel_release();
     void finish_acquire(bool success);
     void finish_release(bool success);
     bool is_acquired() const;

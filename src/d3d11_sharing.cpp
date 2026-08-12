@@ -19,7 +19,6 @@
 #include <d3d11_4.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -160,12 +159,10 @@ bool d3d11_format_to_opencl(DXGI_FORMAT format, cl_image_format* opencl,
 #undef CVK_D3D11_FORMAT
 }
 
-enum class ownership_state
+enum class resource_owner
 {
     d3d11,
-    acquiring,
     opencl,
-    releasing,
 };
 
 } // namespace
@@ -259,7 +256,11 @@ struct cvk_d3d11_shared_resource::impl {
     size_t tight_row_pitch{0};
     size_t tight_slice_pitch{0};
     size_t tight_size{0};
-    std::atomic<ownership_state> ownership{ownership_state::d3d11};
+    std::mutex ownership_mutex;
+    resource_owner physical_owner{resource_owner::d3d11};
+    resource_owner logical_owner{resource_owner::d3d11};
+    size_t pending_transitions{0};
+    bool failed_transition_chain{false};
 };
 
 cvk_d3d11_shared_resource::cvk_d3d11_shared_resource()
@@ -582,29 +583,82 @@ UINT cvk_d3d11_shared_resource::subresource() const {
 size_t cvk_d3d11_shared_resource::size() const { return m_impl->tight_size; }
 
 bool cvk_d3d11_shared_resource::begin_acquire() {
-    ownership_state expected = ownership_state::d3d11;
-    return m_impl->ownership.compare_exchange_strong(
-        expected, ownership_state::acquiring);
+    std::lock_guard<std::mutex> lock(m_impl->ownership_mutex);
+    if (m_impl->failed_transition_chain ||
+        m_impl->logical_owner != resource_owner::d3d11) {
+        return false;
+    }
+    m_impl->logical_owner = resource_owner::opencl;
+    m_impl->pending_transitions++;
+    return true;
 }
 
 bool cvk_d3d11_shared_resource::begin_release() {
-    ownership_state expected = ownership_state::opencl;
-    return m_impl->ownership.compare_exchange_strong(
-        expected, ownership_state::releasing);
+    std::lock_guard<std::mutex> lock(m_impl->ownership_mutex);
+    if (m_impl->failed_transition_chain ||
+        m_impl->logical_owner != resource_owner::opencl) {
+        return false;
+    }
+    m_impl->logical_owner = resource_owner::d3d11;
+    m_impl->pending_transitions++;
+    return true;
+}
+
+void cvk_d3d11_shared_resource::cancel_acquire() {
+    std::lock_guard<std::mutex> lock(m_impl->ownership_mutex);
+    CVK_ASSERT(m_impl->pending_transitions > 0);
+    m_impl->pending_transitions--;
+    m_impl->logical_owner = resource_owner::d3d11;
+    if (m_impl->pending_transitions == 0) {
+        m_impl->logical_owner = m_impl->physical_owner;
+        m_impl->failed_transition_chain = false;
+    }
+}
+
+void cvk_d3d11_shared_resource::cancel_release() {
+    std::lock_guard<std::mutex> lock(m_impl->ownership_mutex);
+    CVK_ASSERT(m_impl->pending_transitions > 0);
+    m_impl->pending_transitions--;
+    m_impl->logical_owner = resource_owner::opencl;
+    if (m_impl->pending_transitions == 0) {
+        m_impl->logical_owner = m_impl->physical_owner;
+        m_impl->failed_transition_chain = false;
+    }
 }
 
 void cvk_d3d11_shared_resource::finish_acquire(bool success) {
-    m_impl->ownership.store(success ? ownership_state::opencl
-                                    : ownership_state::d3d11);
+    std::lock_guard<std::mutex> lock(m_impl->ownership_mutex);
+    CVK_ASSERT(m_impl->pending_transitions > 0);
+    if (success) {
+        m_impl->physical_owner = resource_owner::opencl;
+    } else if (m_impl->pending_transitions > 1) {
+        m_impl->failed_transition_chain = true;
+    }
+    m_impl->pending_transitions--;
+    if (m_impl->pending_transitions == 0) {
+        m_impl->logical_owner = m_impl->physical_owner;
+        m_impl->failed_transition_chain = false;
+    }
 }
 
 void cvk_d3d11_shared_resource::finish_release(bool success) {
-    m_impl->ownership.store(success ? ownership_state::d3d11
-                                    : ownership_state::opencl);
+    std::lock_guard<std::mutex> lock(m_impl->ownership_mutex);
+    CVK_ASSERT(m_impl->pending_transitions > 0);
+    if (success) {
+        m_impl->physical_owner = resource_owner::d3d11;
+    } else if (m_impl->pending_transitions > 1) {
+        m_impl->failed_transition_chain = true;
+    }
+    m_impl->pending_transitions--;
+    if (m_impl->pending_transitions == 0) {
+        m_impl->logical_owner = m_impl->physical_owner;
+        m_impl->failed_transition_chain = false;
+    }
 }
 
 bool cvk_d3d11_shared_resource::is_acquired() const {
-    return m_impl->ownership.load() == ownership_state::opencl;
+    std::lock_guard<std::mutex> lock(m_impl->ownership_mutex);
+    return m_impl->logical_owner == resource_owner::opencl;
 }
 
 cl_int cvk_d3d11_shared_resource::copy_to_opencl(cvk_command_queue* queue,
