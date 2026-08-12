@@ -16,6 +16,7 @@
 
 #include <array>
 #include <memory>
+#include <new>
 
 #include "config.hpp"
 #include "event.hpp"
@@ -46,13 +47,7 @@ struct cvk_executor_thread {
             std::make_unique<std::thread>(&cvk_executor_thread::executor, this);
     }
 
-    void send_group(std::unique_ptr<cvk_command_group>&& group) {
-        m_lock.lock();
-        m_groups.push_back(std::move(group));
-        m_cv.notify_one();
-        m_running = true;
-        m_lock.unlock();
-    }
+    cl_int send_group(std::unique_ptr<cvk_command_group>&& group);
 
     bool is_idle() {
         std::unique_lock<std::mutex> lock(m_lock);
@@ -247,7 +242,7 @@ struct cvk_command_queue : public _cl_command_queue,
 
 private:
     CHECK_RETURN cl_int satisfy_data_dependencies(cvk_command* cmd);
-    void enqueue_command(cvk_command* cmd);
+    CHECK_RETURN cl_int enqueue_command(cvk_command* cmd);
     CHECK_RETURN cl_int enqueue_command_with_retry(cvk_command*,
                                                    _cl_event** event);
     CHECK_RETURN cl_int enqueue_command(cvk_command* cmd, _cl_event** event);
@@ -333,7 +328,13 @@ struct cvk_executor_thread_pool {
 
         // No free executor found in the pool, create a new one
         cvk_executor_thread* exec = new cvk_executor_thread();
-        m_executors[exec] = executor_state::bound;
+        try {
+            m_executors[exec] = executor_state::bound;
+        } catch (...) {
+            exec->shutdown();
+            delete exec;
+            throw;
+        }
         return exec;
     }
 
@@ -421,6 +422,15 @@ struct cvk_command {
         CVK_ASSERT(m_event_deps.size() == 0);
         for (auto* dep : deps) {
             m_event_deps.push_back(dep);
+        }
+    }
+
+    bool reserve_dependencies(size_t count) {
+        try {
+            m_event_deps.reserve(count);
+            return true;
+        } catch (const std::bad_alloc&) {
+            return false;
         }
     }
 
@@ -1158,19 +1168,29 @@ struct cvk_command_d3d11_objects final : public cvk_command {
         }
     }
 
-    const std::vector<cvk_mem*> memory_objects() const override {
-        std::vector<cvk_mem*> objects;
-        objects.reserve(m_objects.size());
-        for (const auto& object : m_objects) {
-            objects.push_back(object);
+    bool is_data_movement() const override { return true; }
+
+    void set_event_status(cl_int status) override {
+        if (status <= CL_COMPLETE && !m_ownership_finalized) {
+            m_ownership_finalized = true;
+            const bool success = status == CL_COMPLETE;
+            for (auto& object : m_objects) {
+                auto& shared = object->d3d11_shared();
+                if (m_acquire) {
+                    shared->finish_acquire(success);
+                } else {
+                    shared->finish_release(success);
+                }
+            }
         }
-        return objects;
+        cvk_command::set_event_status(status);
     }
 
 private:
     CHECK_RETURN cl_int do_action() override final;
 
     bool m_acquire;
+    bool m_ownership_finalized{false};
     std::vector<cvk_mem_holder> m_objects;
 };
 

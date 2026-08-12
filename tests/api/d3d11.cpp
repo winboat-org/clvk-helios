@@ -16,6 +16,7 @@
 
 #include <CL/cl_d3d11.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -239,6 +240,155 @@ TEST_F(D3D11Sharing, AssociationEntrypointsAndBufferRoundTrip) {
     EXPECT_EQ(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &memory, 0, nullptr,
                                               nullptr),
               CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR);
+    EXPECT_CL_SUCCESS(clReleaseMemObject(memory));
+}
+
+TEST_F(D3D11Sharing, EnablesDeviceWideMultithreadProtection) {
+    com_holder<ID3D11Multithread> multithread;
+    ASSERT_TRUE(SUCCEEDED(m_d3d_context->QueryInterface(
+        __uuidof(ID3D11Multithread),
+        reinterpret_cast<void**>(multithread.put()))));
+    EXPECT_TRUE(multithread->GetMultithreadProtected());
+}
+
+TEST_F(D3D11Sharing, RejectsSingleThreadedD3D11Device) {
+    com_holder<ID3D11Device> single_threaded_device;
+    com_holder<ID3D11DeviceContext> single_threaded_context;
+    D3D_FEATURE_LEVEL feature_level;
+    ASSERT_TRUE(SUCCEEDED(
+        D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+                          D3D11_CREATE_DEVICE_SINGLETHREADED, nullptr, 0,
+                          D3D11_SDK_VERSION, single_threaded_device.put(),
+                          &feature_level, single_threaded_context.put())));
+
+    const cl_context_properties properties[] = {
+        CL_CONTEXT_PLATFORM,
+        reinterpret_cast<cl_context_properties>(gPlatform),
+        CL_CONTEXT_D3D11_DEVICE_KHR,
+        reinterpret_cast<cl_context_properties>(single_threaded_device.get()),
+        0,
+    };
+    cl_int error;
+    cl_context context =
+        clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &error);
+    EXPECT_EQ(context, nullptr);
+    EXPECT_EQ(error, CL_INVALID_D3D11_DEVICE_KHR);
+}
+
+TEST_F(D3D11Sharing, KernelAccessFlagsDoNotElideOwnershipCopies) {
+    std::vector<uint8_t> original(256);
+    for (size_t i = 0; i < original.size(); i++) {
+        original[i] = static_cast<uint8_t>(i ^ 0x6d);
+    }
+
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(original.size());
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    D3D11_SUBRESOURCE_DATA initial{original.data(), 0, 0};
+
+    com_holder<ID3D11Buffer> write_only_buffer;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateBuffer(&desc, &initial, write_only_buffer.put())));
+    cl_int error;
+    cl_mem write_only = clCreateFromD3D11BufferKHR(
+        m_context, CL_MEM_WRITE_ONLY, write_only_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(write_only, nullptr);
+
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(m_queue, 1, &write_only,
+                                                      0, nullptr, nullptr));
+    std::vector<uint8_t> acquired(original.size());
+    ASSERT_CL_SUCCESS(clEnqueueReadBuffer(m_queue, write_only, CL_TRUE, 0,
+                                          acquired.size(), acquired.data(), 0,
+                                          nullptr, nullptr));
+    EXPECT_EQ(acquired, original);
+
+    std::vector<uint8_t> partial(original.size() / 2, 0xb4);
+    ASSERT_CL_SUCCESS(clEnqueueWriteBuffer(m_queue, write_only, CL_TRUE, 0,
+                                           partial.size(), partial.data(), 0,
+                                           nullptr, nullptr));
+    ASSERT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &write_only,
+                                                      0, nullptr, nullptr));
+    std::vector<uint8_t> expected = original;
+    std::copy(partial.begin(), partial.end(), expected.begin());
+    EXPECT_EQ(read_buffer(write_only_buffer.get(), expected.size()), expected);
+    EXPECT_CL_SUCCESS(clReleaseMemObject(write_only));
+
+    com_holder<ID3D11Buffer> read_only_buffer;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateBuffer(&desc, &initial, read_only_buffer.put())));
+    cl_mem read_only = clCreateFromD3D11BufferKHR(
+        m_context, CL_MEM_READ_ONLY, read_only_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(read_only, nullptr);
+
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(m_queue, 1, &read_only, 0,
+                                                      nullptr, nullptr));
+    std::vector<uint8_t> replacement(original.size(), 0x39);
+    ASSERT_CL_SUCCESS(
+        clEnqueueWriteBuffer(m_queue, read_only, CL_TRUE, 0, replacement.size(),
+                             replacement.data(), 0, nullptr, nullptr));
+    ASSERT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &read_only, 0,
+                                                      nullptr, nullptr));
+    EXPECT_EQ(read_buffer(read_only_buffer.get(), replacement.size()),
+              replacement);
+    EXPECT_CL_SUCCESS(clReleaseMemObject(read_only));
+}
+
+TEST_F(D3D11Sharing, FailedDependenciesRollBackOwnership) {
+    std::vector<uint8_t> original(64, 0x52);
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(original.size());
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    D3D11_SUBRESOURCE_DATA initial{original.data(), 0, 0};
+    com_holder<ID3D11Buffer> d3d_buffer;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateBuffer(&desc, &initial, d3d_buffer.put())));
+
+    cl_int error;
+    cl_mem memory = clCreateFromD3D11BufferKHR(m_context, CL_MEM_READ_WRITE,
+                                               d3d_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(memory, nullptr);
+
+    cl_event failed_dependency = clCreateUserEvent(m_context, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(failed_dependency, nullptr);
+    ASSERT_CL_SUCCESS(
+        clSetUserEventStatus(failed_dependency, CL_INVALID_OPERATION));
+    cl_event acquire_event = nullptr;
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(
+        m_queue, 1, &memory, 1, &failed_dependency, &acquire_event));
+    EXPECT_EQ(clWaitForEvents(1, &acquire_event),
+              CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+    EXPECT_CL_SUCCESS(clReleaseEvent(acquire_event));
+    EXPECT_CL_SUCCESS(clReleaseEvent(failed_dependency));
+
+    cl_command_queue retry_queue =
+        clCreateCommandQueue(m_context, gDevice, 0, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(retry_queue, nullptr);
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(retry_queue, 1, &memory,
+                                                      0, nullptr, nullptr));
+
+    failed_dependency = clCreateUserEvent(m_context, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_CL_SUCCESS(
+        clSetUserEventStatus(failed_dependency, CL_INVALID_OPERATION));
+    EXPECT_EQ(clEnqueueReleaseD3D11ObjectsKHR(retry_queue, 1, &memory, 1,
+                                              &failed_dependency, nullptr),
+              CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+    EXPECT_CL_SUCCESS(clReleaseEvent(failed_dependency));
+
+    cl_command_queue second_retry_queue =
+        clCreateCommandQueue(m_context, gDevice, 0, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(second_retry_queue, nullptr);
+    EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(
+        second_retry_queue, 1, &memory, 0, nullptr, nullptr));
+
+    EXPECT_CL_SUCCESS(clReleaseCommandQueue(second_retry_queue));
+    EXPECT_CL_SUCCESS(clReleaseCommandQueue(retry_queue));
     EXPECT_CL_SUCCESS(clReleaseMemObject(memory));
 }
 

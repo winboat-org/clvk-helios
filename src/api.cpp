@@ -28,6 +28,7 @@
 #include "semaphore.hpp"
 #include "tracing.hpp"
 
+#include <new>
 #include <type_traits>
 
 #define LOG_API_CALL(fmt, ...)                                                 \
@@ -1321,15 +1322,20 @@ cvk_context* cvk_create_context(
         return nullptr;
     }
 
-    auto context = std::make_unique<cvk_context>(icd_downcast(devices[0]),
-                                                 properties, user_data);
+    try {
+        auto context = std::make_unique<cvk_context>(icd_downcast(devices[0]),
+                                                     properties, user_data);
 
-    *errcode_ret = context->init();
-    if (*errcode_ret != CL_SUCCESS) {
+        *errcode_ret = context->init();
+        if (*errcode_ret != CL_SUCCESS) {
+            return nullptr;
+        }
+
+        return context.release();
+    } catch (const std::bad_alloc&) {
+        *errcode_ret = CL_OUT_OF_HOST_MEMORY;
         return nullptr;
     }
-
-    return context.release();
 }
 
 // Context APIs
@@ -5009,20 +5015,25 @@ cl_mem CLVK_API_CALL clCreateFromD3D11BufferKHR(cl_context context,
     } else if (!valid_interop_mem_flags(flags)) {
         err = CL_INVALID_VALUE;
     } else {
-        auto* ctx = icd_downcast(context);
-        if (ctx->d3d11_interop() == nullptr) {
-            err = CL_INVALID_CONTEXT;
-        } else {
-            auto shared = cvk_d3d11_shared_resource::create_buffer(
-                ctx->d3d11_interop(), resource, &err);
-            if (shared != nullptr) {
-                auto created = cvk_buffer::create(ctx, flags, shared->size(),
-                                                  nullptr, &err);
-                if (created != nullptr) {
-                    created->set_d3d11_shared(std::move(shared));
-                    buffer = created.release();
+        try {
+            auto* ctx = icd_downcast(context);
+            if (ctx->d3d11_interop() == nullptr) {
+                err = CL_INVALID_CONTEXT;
+            } else {
+                auto shared = cvk_d3d11_shared_resource::create_buffer(
+                    ctx->d3d11_interop(), resource, &err);
+                if (shared != nullptr) {
+                    auto created = cvk_buffer::create(
+                        ctx, flags, shared->size(), nullptr, &err);
+                    if (created != nullptr) {
+                        created->set_d3d11_shared(std::move(shared));
+                        buffer = created.release();
+                    }
                 }
             }
+        } catch (const std::bad_alloc&) {
+            err = CL_OUT_OF_HOST_MEMORY;
+            buffer = nullptr;
         }
     }
 
@@ -5045,33 +5056,39 @@ cl_mem create_from_d3d11_texture(cl_context context, cl_mem_flags flags,
     } else if (!valid_interop_mem_flags(flags)) {
         err = CL_INVALID_VALUE;
     } else {
-        auto* ctx = icd_downcast(context);
-        if (ctx->d3d11_interop() == nullptr) {
-            err = CL_INVALID_CONTEXT;
-        } else {
-            cl_image_desc desc{};
-            cl_image_format format{};
-            std::shared_ptr<cvk_d3d11_shared_resource> shared;
-            if constexpr (std::is_same_v<Texture, ID3D11Texture2D>) {
-                shared = cvk_d3d11_shared_resource::create_texture2d(
-                    ctx->d3d11_interop(), resource, subresource, &desc, &format,
-                    &err);
+        try {
+            auto* ctx = icd_downcast(context);
+            if (ctx->d3d11_interop() == nullptr) {
+                err = CL_INVALID_CONTEXT;
             } else {
-                shared = cvk_d3d11_shared_resource::create_texture3d(
-                    ctx->d3d11_interop(), resource, subresource, &desc, &format,
-                    &err);
-            }
-            if (shared != nullptr) {
-                std::vector<cl_mem_properties> properties;
-                image = cvk_image::create(ctx, flags, &desc, &format, nullptr,
+                cl_image_desc desc{};
+                cl_image_format format{};
+                std::shared_ptr<cvk_d3d11_shared_resource> shared;
+                if constexpr (std::is_same_v<Texture, ID3D11Texture2D>) {
+                    shared = cvk_d3d11_shared_resource::create_texture2d(
+                        ctx->d3d11_interop(), resource, subresource, &desc,
+                        &format, &err);
+                } else {
+                    shared = cvk_d3d11_shared_resource::create_texture3d(
+                        ctx->d3d11_interop(), resource, subresource, &desc,
+                        &format, &err);
+                }
+                if (shared != nullptr) {
+                    std::vector<cl_mem_properties> properties;
+                    image =
+                        cvk_image::create(ctx, flags, &desc, &format, nullptr,
                                           std::move(properties), &err);
-                if (err == CL_IMAGE_FORMAT_NOT_SUPPORTED) {
-                    err = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
-                }
-                if (image != nullptr) {
-                    image->set_d3d11_shared(std::move(shared));
+                    if (err == CL_IMAGE_FORMAT_NOT_SUPPORTED) {
+                        err = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
+                    }
+                    if (image != nullptr) {
+                        image->set_d3d11_shared(std::move(shared));
+                    }
                 }
             }
+        } catch (const std::bad_alloc&) {
+            err = CL_OUT_OF_HOST_MEMORY;
+            image = nullptr;
         }
     }
 
@@ -5137,17 +5154,21 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
     }
 
     std::vector<cvk_mem*> objects;
-    objects.reserve(num_objects);
-    for (cl_uint i = 0; i < num_objects; i++) {
-        if (!is_valid_mem_object(mem_objects[i]) ||
-            !icd_downcast(mem_objects[i])->is_d3d11_shared()) {
-            return CL_INVALID_MEM_OBJECT;
+    try {
+        objects.reserve(num_objects);
+        for (cl_uint i = 0; i < num_objects; i++) {
+            if (!is_valid_mem_object(mem_objects[i]) ||
+                !icd_downcast(mem_objects[i])->is_d3d11_shared()) {
+                return CL_INVALID_MEM_OBJECT;
+            }
+            auto* object = icd_downcast(mem_objects[i]);
+            if (!is_same_context(queue, object)) {
+                return CL_INVALID_CONTEXT;
+            }
+            objects.push_back(object);
         }
-        auto* object = icd_downcast(mem_objects[i]);
-        if (!is_same_context(queue, object)) {
-            return CL_INVALID_CONTEXT;
-        }
-        objects.push_back(object);
+    } catch (const std::bad_alloc&) {
+        return CL_OUT_OF_HOST_MEMORY;
     }
 
     size_t transitioned = 0;
@@ -5173,15 +5194,30 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
                        : CL_D3D11_RESOURCE_NOT_ACQUIRED_KHR;
     }
 
-    auto* command = new cvk_command_d3d11_objects(queue, acquire, objects);
+    cvk_command_d3d11_objects* command;
+    try {
+        command = new cvk_command_d3d11_objects(queue, acquire, objects);
+    } catch (const std::bad_alloc&) {
+        for (auto* object : objects) {
+            auto& shared = object->d3d11_shared();
+            if (acquire) {
+                shared->finish_acquire(false);
+            } else {
+                shared->finish_release(false);
+            }
+        }
+        return CL_OUT_OF_HOST_MEMORY;
+    }
     cl_int result = queue->enqueue_command_with_deps(
         command, num_events_in_wait_list, event_wait_list, event);
-    for (auto* object : objects) {
-        auto& shared = object->d3d11_shared();
-        if (acquire) {
-            shared->finish_acquire(result == CL_SUCCESS);
-        } else {
-            shared->finish_release(result == CL_SUCCESS);
+    if (result != CL_SUCCESS) {
+        for (auto* object : objects) {
+            auto& shared = object->d3d11_shared();
+            if (acquire) {
+                shared->finish_acquire(false);
+            } else {
+                shared->finish_release(false);
+            }
         }
     }
     // With CPU-backed interop there is no semaphore that can make future

@@ -18,6 +18,7 @@
 
 #if defined(_WIN32)
 #include <CL/cl_d3d10.h>
+#include <CL/cl_gl.h>
 #endif
 
 TEST(Platform, DeviceQueryWithMultipleTypes) {
@@ -67,6 +68,17 @@ TEST(Platform, InteropUserSyncContextProperty) {
 }
 
 #if defined(_WIN32)
+TEST(Platform, InteropUserSyncCannotBeCombinedWithGlSharingProperties) {
+    const cl_context_properties properties[] = {
+        CL_CONTEXT_INTEROP_USER_SYNC, CL_FALSE, CL_GL_CONTEXT_KHR, 1, 0,
+    };
+    cl_int error;
+    cl_context context =
+        clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &error);
+    EXPECT_EQ(context, nullptr);
+    EXPECT_EQ(error, CL_INVALID_PROPERTY);
+}
+
 TEST(Platform, D3D10DeviceAssociationExtension) {
     size_t extension_size = 0;
     ASSERT_EQ(clGetPlatformInfo(gPlatform, CL_PLATFORM_EXTENSIONS, 0, nullptr,

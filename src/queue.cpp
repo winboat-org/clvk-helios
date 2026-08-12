@@ -29,6 +29,22 @@ static cvk_executor_thread_pool* get_thread_pool() {
     return state->thread_pool();
 }
 
+cl_int
+cvk_executor_thread::send_group(std::unique_ptr<cvk_command_group>&& group) {
+    std::lock_guard<std::mutex> lock(m_lock);
+    try {
+        m_groups.push_back(std::move(group));
+    } catch (const std::bad_alloc&) {
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+    for (auto* command : m_groups.back()->commands) {
+        command->set_event_status(CL_SUBMITTED);
+    }
+    m_cv.notify_one();
+    m_running = true;
+    return CL_SUCCESS;
+}
+
 cvk_command_queue::cvk_command_queue(
     cvk_context* ctx, cvk_device* device,
     cl_command_queue_properties properties,
@@ -118,18 +134,23 @@ cl_int cvk_command_queue::satisfy_data_dependencies(cvk_command* cmd) {
     return CL_SUCCESS;
 }
 
-void cvk_command_queue::enqueue_command(cvk_command* cmd) {
+cl_int cvk_command_queue::enqueue_command(cvk_command* cmd) {
     TRACE_FUNCTION("queue", (uintptr_t)this, "cmd", (uintptr_t)cmd);
     // clvk only supports inorder queues at the moment.
     // But as the commands can be executed by 2 threads (1 executor and the main
     // thread), we need to explicit the dependency to ensure it will be
     // respected.
-    if (!m_groups.back()->commands.empty()) {
-        cmd->add_dependency(m_groups.back()->commands.back()->event());
-    } else if (m_finish_event != nullptr) {
-        cmd->add_dependency(m_finish_event);
+    try {
+        if (!m_groups.back()->commands.empty()) {
+            cmd->add_dependency(m_groups.back()->commands.back()->event());
+        } else if (m_finish_event != nullptr) {
+            cmd->add_dependency(m_finish_event);
+        }
+        m_groups.back()->commands.push_back(cmd);
+    } catch (const std::bad_alloc&) {
+        return CL_OUT_OF_HOST_MEMORY;
     }
-    m_groups.back()->commands.push_back(cmd);
+    return CL_SUCCESS;
 }
 
 cl_int cvk_command_queue::enqueue_command_with_retry(cvk_command* cmd,
@@ -220,7 +241,9 @@ cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event) {
             }
         }
 
-        enqueue_command(cmd);
+        if ((err = enqueue_command(cmd)) != CL_SUCCESS) {
+            return err;
+        }
     }
 
     cvk_debug_fn("enqueued command %p (%s), event %p", cmd,
@@ -255,6 +278,10 @@ cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event) {
 cl_int cvk_command_queue::enqueue_command_with_deps(
     cvk_command* cmd, cl_uint num_dep_events, _cl_event* const* dep_events,
     _cl_event** event) {
+    if (!cmd->reserve_dependencies(static_cast<size_t>(num_dep_events) + 1)) {
+        delete cmd;
+        return CL_OUT_OF_HOST_MEMORY;
+    }
     cmd->set_dependencies(num_dep_events, dep_events);
     return enqueue_command_with_retry(cmd, event);
 }
@@ -262,6 +289,10 @@ cl_int cvk_command_queue::enqueue_command_with_deps(
 cl_int cvk_command_queue::enqueue_command_with_deps(
     cvk_command* cmd, bool blocking, cl_uint num_dep_events,
     _cl_event* const* dep_events, _cl_event** event) {
+    if (!cmd->reserve_dependencies(static_cast<size_t>(num_dep_events) + 1)) {
+        delete cmd;
+        return CL_OUT_OF_HOST_MEMORY;
+    }
     cmd->set_dependencies(num_dep_events, dep_events);
 
     _cl_event* evt;
@@ -291,7 +322,10 @@ cl_int cvk_command_queue::end_current_command_batch(bool from_flush) {
         if (!m_command_batch->end()) {
             return CL_OUT_OF_RESOURCES;
         }
-        enqueue_command(m_command_batch);
+        cl_int err = enqueue_command(m_command_batch);
+        if (err != CL_SUCCESS) {
+            return err;
+        }
 
         for (auto& controller : m_controllers) {
             controller->update_after_end_current_command_batch(from_flush);
@@ -498,33 +532,41 @@ cl_int cvk_command_queue::flush_no_lock() {
         return CL_SUCCESS;
     }
 
+    // Allocate everything that may fail before transferring ownership of the
+    // queued commands to the executor.
+    std::unique_ptr<cvk_command_group> replacement;
+    try {
+        replacement = std::make_unique<cvk_command_group>();
+        if (m_executor == nullptr) {
+            m_executor = get_thread_pool()->get_executor();
+        }
+    } catch (const std::bad_alloc&) {
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+
     // Get the commands from the queue and prepare the queue to receive
-    // further commands
+    // further commands. Assignment of unique_ptr cannot throw.
     group = std::move(m_groups.front());
-    m_groups.pop_front();
-    m_groups.push_back(std::make_unique<cvk_command_group>());
+    m_groups.front() = std::move(replacement);
 
     cvk_debug_fn("groups.size() = %zu", m_groups.size());
 
     CVK_ASSERT(group->commands.size() > 0);
 
-    // Set event state and profiling info
-    for (auto cmd : group->commands) {
-        cmd->set_event_status(CL_SUBMITTED);
-    }
-
-    // Create execution thread if it doesn't exist
-    if (m_executor == nullptr) {
-        m_executor = get_thread_pool()->get_executor();
-    }
-
     auto ev = group->commands.back()->event();
-    m_finish_event.reset(ev);
+    cvk_event_holder finish_event(ev);
     cvk_debug_fn("set finish event to %p", ev);
 
     // Submit command group to executor
-    m_executor->send_group(std::move(group));
     group_sent();
+    err = m_executor->send_group(std::move(group));
+    if (err != CL_SUCCESS) {
+        group_completed();
+        CVK_ASSERT(group != nullptr);
+        m_groups.front() = std::move(group);
+        return err;
+    }
+    m_finish_event = std::move(finish_event);
 
     return CL_SUCCESS;
 }
@@ -544,8 +586,14 @@ cl_int cvk_command_queue::finish() {
 
     if (m_finish_event != nullptr) {
         _cl_event* evt_list = (_cl_event*)&*m_finish_event;
-        execute_cmds_required_by_no_lock(1, &evt_list, lock);
-        m_finish_event->wait();
+        status = execute_cmds_required_by_no_lock(1, &evt_list, lock);
+        cl_int event_status = m_finish_event->wait();
+        if (status != CL_SUCCESS) {
+            return status;
+        }
+        if (event_status != CL_COMPLETE) {
+            return event_status;
+        }
     }
 
     return CL_SUCCESS;

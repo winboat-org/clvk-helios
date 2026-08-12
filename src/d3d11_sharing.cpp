@@ -16,11 +16,14 @@
 
 #include "d3d11_sharing.hpp"
 
+#include <d3d11_4.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <unordered_set>
 #include <vector>
@@ -170,12 +173,13 @@ enum class ownership_state
 struct cvk_d3d11_interop::impl {
     ID3D11Device* device{nullptr};
     ID3D11DeviceContext* immediate_context{nullptr};
-    std::mutex mutex;
+    ID3D11Multithread* multithread{nullptr};
 };
 
 cvk_d3d11_interop::cvk_d3d11_interop() : m_impl(std::make_unique<impl>()) {}
 
 cvk_d3d11_interop::~cvk_d3d11_interop() {
+    release_com(m_impl->multithread);
     release_com(m_impl->immediate_context);
     release_com(m_impl->device);
 }
@@ -191,6 +195,11 @@ cl_int cvk_d3d11_interop::init(ID3D11Device* device) {
     if (FAILED(result) || retained == nullptr) {
         return CL_INVALID_D3D11_DEVICE_KHR;
     }
+    if ((retained->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED) !=
+        0) {
+        retained->Release();
+        return CL_INVALID_D3D11_DEVICE_KHR;
+    }
 
     ID3D11DeviceContext* immediate_context = nullptr;
     retained->GetImmediateContext(&immediate_context);
@@ -199,8 +208,19 @@ cl_int cvk_d3d11_interop::init(ID3D11Device* device) {
         return CL_INVALID_D3D11_DEVICE_KHR;
     }
 
+    ID3D11Multithread* multithread = nullptr;
+    result = immediate_context->QueryInterface(
+        __uuidof(ID3D11Multithread), reinterpret_cast<void**>(&multithread));
+    if (FAILED(result) || multithread == nullptr) {
+        immediate_context->Release();
+        retained->Release();
+        return CL_INVALID_D3D11_DEVICE_KHR;
+    }
+    multithread->SetMultithreadProtected(TRUE);
+
     m_impl->device = retained;
     m_impl->immediate_context = immediate_context;
+    m_impl->multithread = multithread;
     return CL_SUCCESS;
 }
 
@@ -221,7 +241,9 @@ bool cvk_d3d11_interop::owns_resource(ID3D11Resource* resource) const {
     return result;
 }
 
-std::mutex& cvk_d3d11_interop::mutex() { return m_impl->mutex; }
+void cvk_d3d11_interop::lock() { m_impl->multithread->Enter(); }
+
+void cvk_d3d11_interop::unlock() { m_impl->multithread->Leave(); }
 
 struct cvk_d3d11_shared_resource::impl {
     cvk_d3d11_interop* interop{nullptr};
@@ -269,7 +291,17 @@ std::shared_ptr<cvk_d3d11_shared_resource> cvk_d3d11_shared_resource::finish(
         return nullptr;
     }
 
-    if (!register_resource(identity, subresource)) {
+    bool registered;
+    try {
+        registered = register_resource(identity, subresource);
+    } catch (const std::bad_alloc&) {
+        *errcode_ret = CL_OUT_OF_HOST_MEMORY;
+        release_com(identity);
+        release_com(staging);
+        release_com(resource);
+        return nullptr;
+    }
+    if (!registered) {
         *errcode_ret = CL_INVALID_D3D11_RESOURCE_KHR;
         release_com(identity);
         release_com(staging);
@@ -585,7 +617,7 @@ cl_int cvk_d3d11_shared_resource::copy_to_opencl(cvk_command_queue* queue,
     }
 
     {
-        std::lock_guard<std::mutex> lock(m_impl->interop->mutex());
+        std::lock_guard<cvk_d3d11_interop> lock(*m_impl->interop);
         auto* context = m_impl->interop->immediate_context();
         context->CopySubresourceRegion(m_impl->staging, 0, 0, 0, 0,
                                        m_impl->resource, m_impl->subresource,
@@ -615,12 +647,6 @@ cl_int cvk_d3d11_shared_resource::copy_to_opencl(cvk_command_queue* queue,
         context->Unmap(m_impl->staging, 0);
     }
 
-    // A write-only OpenCL object cannot observe the old Direct3D contents, but
-    // the copy/map above is still required to wait for prior D3D11 access.
-    if (mem->has_flags(CL_MEM_WRITE_ONLY)) {
-        return CL_SUCCESS;
-    }
-
     if (m_impl->kind == cvk_d3d11_resource_kind::buffer) {
         return clEnqueueWriteBuffer(queue, mem, CL_TRUE, 0, data.size(),
                                     data.data(), 0, nullptr, nullptr);
@@ -639,11 +665,6 @@ cl_int cvk_d3d11_shared_resource::copy_to_opencl(cvk_command_queue* queue,
 
 cl_int cvk_d3d11_shared_resource::copy_from_opencl(cvk_command_queue* queue,
                                                    cvk_mem* mem) {
-    // Read-only OpenCL objects cannot have changed the resource.
-    if (mem->has_flags(CL_MEM_READ_ONLY)) {
-        return CL_SUCCESS;
-    }
-
     std::vector<uint8_t> data;
     try {
         data.resize(m_impl->tight_size);
@@ -670,7 +691,7 @@ cl_int cvk_d3d11_shared_resource::copy_from_opencl(cvk_command_queue* queue,
         return result;
     }
 
-    std::lock_guard<std::mutex> lock(m_impl->interop->mutex());
+    std::lock_guard<cvk_d3d11_interop> lock(*m_impl->interop);
     auto* context = m_impl->interop->immediate_context();
     D3D11_MAPPED_SUBRESOURCE mapped{};
     HRESULT map_result =
@@ -705,22 +726,32 @@ cl_int cvk_command_d3d11_objects::do_action() {
     // Use a short-lived queue for the host<->Vulkan leg so calling a blocking
     // OpenCL transfer here cannot recursively enqueue onto this command's own
     // executor.
-    std::vector<cl_queue_properties> properties;
-    auto* transfer_queue = new cvk_command_queue(
-        m_queue->context(), m_queue->device(), 0, std::move(properties));
+    cvk_command_queue* transfer_queue;
+    try {
+        std::vector<cl_queue_properties> properties;
+        transfer_queue = new cvk_command_queue(
+            m_queue->context(), m_queue->device(), 0, std::move(properties));
+    } catch (const std::bad_alloc&) {
+        return CL_OUT_OF_HOST_MEMORY;
+    }
     cl_int result = transfer_queue->init();
     if (result != CL_SUCCESS) {
         transfer_queue->release();
         return result;
     }
 
-    for (auto& object : m_objects) {
-        auto& shared = object->d3d11_shared();
-        result = m_acquire ? shared->copy_to_opencl(transfer_queue, object)
-                           : shared->copy_from_opencl(transfer_queue, object);
-        if (result != CL_SUCCESS) {
-            break;
+    try {
+        for (auto& object : m_objects) {
+            auto& shared = object->d3d11_shared();
+            result = m_acquire
+                         ? shared->copy_to_opencl(transfer_queue, object)
+                         : shared->copy_from_opencl(transfer_queue, object);
+            if (result != CL_SUCCESS) {
+                break;
+            }
         }
+    } catch (const std::bad_alloc&) {
+        result = CL_OUT_OF_HOST_MEMORY;
     }
 
     transfer_queue->release();
