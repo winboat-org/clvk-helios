@@ -99,8 +99,8 @@ private:
     finish(cvk_d3d11_interop* interop, ID3D11Resource* resource,
            ID3D11Resource* staging, IUnknown* identity,
            cvk_d3d11_resource_kind kind, UINT subresource, size_t width,
-           size_t height, size_t depth, size_t element_size,
-           cl_int* errcode_ret);
+           size_t height, size_t depth, size_t element_size, D3D11_USAGE usage,
+           UINT cpu_access_flags, cl_int* errcode_ret);
 
     struct impl;
     std::unique_ptr<impl> m_impl;

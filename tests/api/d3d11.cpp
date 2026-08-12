@@ -395,9 +395,13 @@ TEST_F(D3D11Sharing, FailedDependenciesRollBackOwnership) {
     ASSERT_CL_SUCCESS(error);
     ASSERT_CL_SUCCESS(
         clSetUserEventStatus(failed_dependency, CL_INVALID_OPERATION));
-    EXPECT_EQ(clEnqueueReleaseD3D11ObjectsKHR(retry_queue, 1, &memory, 1,
-                                              &failed_dependency, nullptr),
+    cl_event release_event = nullptr;
+    EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(
+        retry_queue, 1, &memory, 1, &failed_dependency, &release_event));
+    ASSERT_NE(release_event, nullptr);
+    EXPECT_EQ(clWaitForEvents(1, &release_event),
               CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+    EXPECT_CL_SUCCESS(clReleaseEvent(release_event));
     EXPECT_CL_SUCCESS(clReleaseEvent(failed_dependency));
 
     cl_command_queue second_retry_queue =
@@ -427,19 +431,15 @@ TEST_F(D3D11Sharing, EventCallbackCanReenterOwnershipApisDuringRelease) {
         m_d3d_device->CreateBuffer(&desc, &data, second_buffer.put())));
 
     cl_int error;
-    cl_mem first = clCreateFromD3D11BufferKHR(
-        m_context, CL_MEM_READ_WRITE, first_buffer.get(), &error);
+    cl_mem first = clCreateFromD3D11BufferKHR(m_context, CL_MEM_READ_WRITE,
+                                              first_buffer.get(), &error);
     ASSERT_CL_SUCCESS(error);
     ASSERT_NE(first, nullptr);
-    cl_mem second = clCreateFromD3D11BufferKHR(
-        m_context, CL_MEM_READ_WRITE, second_buffer.get(), &error);
+    cl_mem second = clCreateFromD3D11BufferKHR(m_context, CL_MEM_READ_WRITE,
+                                               second_buffer.get(), &error);
     ASSERT_CL_SUCCESS(error);
     ASSERT_NE(second, nullptr);
 
-    cl_command_queue callback_queue =
-        clCreateCommandQueue(m_context, gDevice, 0, &error);
-    ASSERT_CL_SUCCESS(error);
-    ASSERT_NE(callback_queue, nullptr);
     ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(m_queue, 1, &first, 0,
                                                       nullptr, nullptr));
     ASSERT_CL_SUCCESS(clFinish(m_queue));
@@ -447,15 +447,19 @@ TEST_F(D3D11Sharing, EventCallbackCanReenterOwnershipApisDuringRelease) {
     cl_event gate = clCreateUserEvent(m_context, &error);
     ASSERT_CL_SUCCESS(error);
     ASSERT_NE(gate, nullptr);
+    cl_command_queue source_queue =
+        clCreateCommandQueue(m_context, gDevice, 0, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(source_queue, nullptr);
     std::vector<uint8_t> readback(size);
     cl_event read_event = nullptr;
-    ASSERT_CL_SUCCESS(clEnqueueReadBuffer(m_queue, first, CL_FALSE, 0, size,
-                                          readback.data(), 1, &gate,
+    ASSERT_CL_SUCCESS(clEnqueueReadBuffer(source_queue, first, CL_FALSE, 0,
+                                          size, readback.data(), 1, &gate,
                                           &read_event));
-    callback_acquire_data callback_data{callback_queue, second};
-    ASSERT_CL_SUCCESS(clSetEventCallback(read_event, CL_COMPLETE,
-                                         acquire_d3d11_from_callback,
-                                         &callback_data));
+    callback_acquire_data callback_data{m_queue, second};
+    ASSERT_CL_SUCCESS(clSetEventCallback(
+        read_event, CL_COMPLETE, acquire_d3d11_from_callback, &callback_data));
+    ASSERT_CL_SUCCESS(clFlush(source_queue));
 
     std::atomic<bool> release_started{false};
     std::atomic<cl_int> gate_result{CL_INVALID_OPERATION};
@@ -466,28 +470,281 @@ TEST_F(D3D11Sharing, EventCallbackCanReenterOwnershipApisDuringRelease) {
         // Give the release call time to reach its implicit finish. With the
         // old lock scope, the callback below then waited on the reservation
         // mutex while finish waited for the callback, deadlocking both.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         gate_result.store(clSetUserEventStatus(gate, CL_COMPLETE));
     });
     release_started.store(true);
-    const cl_int release_result = clEnqueueReleaseD3D11ObjectsKHR(
-        m_queue, 1, &first, 0, nullptr, nullptr);
+    cl_int release_result = clEnqueueReleaseD3D11ObjectsKHR(
+        m_queue, 1, &first, 1, &read_event, nullptr);
     gate_thread.join();
 
     EXPECT_CL_SUCCESS(release_result);
     EXPECT_CL_SUCCESS(gate_result.load());
     EXPECT_CL_SUCCESS(callback_data.result.load());
-    EXPECT_CL_SUCCESS(clFinish(callback_queue));
+    EXPECT_CL_SUCCESS(clFinish(m_queue));
     if (callback_data.result.load() == CL_SUCCESS) {
-        EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(
-            callback_queue, 1, &second, 0, nullptr, nullptr));
+        EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &second,
+                                                          0, nullptr, nullptr));
     }
 
     EXPECT_CL_SUCCESS(clReleaseEvent(read_event));
     EXPECT_CL_SUCCESS(clReleaseEvent(gate));
-    EXPECT_CL_SUCCESS(clReleaseCommandQueue(callback_queue));
+    EXPECT_CL_SUCCESS(clReleaseCommandQueue(source_queue));
     EXPECT_CL_SUCCESS(clReleaseMemObject(second));
     EXPECT_CL_SUCCESS(clReleaseMemObject(first));
+}
+
+#ifdef CLVK_UNIT_TESTING_ENABLED
+TEST_F(D3D11Sharing, FinishAllowsSameQueueCallbackEnqueue) {
+    constexpr size_t size = 64;
+    std::vector<uint8_t> input(size, 0x27);
+    cl_int error;
+    cl_mem source = clCreateBuffer(m_context,
+                                   CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                   size, input.data(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(source, nullptr);
+
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(size);
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    com_holder<ID3D11Buffer> d3d_buffer;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateBuffer(&desc, nullptr, d3d_buffer.put())));
+    cl_mem shared = clCreateFromD3D11BufferKHR(
+        m_context, CL_MEM_READ_WRITE, d3d_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(shared, nullptr);
+
+    cl_event gate = clCreateUserEvent(m_context, &error);
+    ASSERT_CL_SUCCESS(error);
+    std::vector<uint8_t> output(size);
+    cl_event read_event = nullptr;
+    ASSERT_CL_SUCCESS(clEnqueueReadBuffer(m_queue, source, CL_FALSE, 0, size,
+                                          output.data(), 1, &gate,
+                                          &read_event));
+    callback_acquire_data callback_data{m_queue, shared};
+    ASSERT_CL_SUCCESS(clSetEventCallback(
+        read_event, CL_COMPLETE, acquire_d3d11_from_callback, &callback_data));
+    ASSERT_CL_SUCCESS(clFlush(m_queue));
+
+    std::atomic<cl_int> gate_result{CL_INVALID_OPERATION};
+    std::thread gate_thread([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        gate_result.store(clSetUserEventStatus(gate, CL_COMPLETE));
+    });
+    {
+        // Ensure the executor owns the gated group. The old finish path then
+        // waited with m_lock held, deadlocking when the completion callback
+        // attempted to enqueue onto this same queue.
+        auto handoff_delay = CLVK_CONFIG_SCOPED_OVERRIDE(
+            finish_executor_handoff_delay_ms, uint32_t, 100, true);
+        EXPECT_CL_SUCCESS(clFinish(m_queue));
+    }
+    gate_thread.join();
+
+    EXPECT_CL_SUCCESS(gate_result.load());
+    EXPECT_EQ(output, input);
+    EXPECT_CL_SUCCESS(callback_data.result.load());
+    EXPECT_CL_SUCCESS(clFinish(m_queue));
+    if (callback_data.result.load() == CL_SUCCESS) {
+        EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(
+            m_queue, 1, &shared, 0, nullptr, nullptr));
+    }
+    EXPECT_CL_SUCCESS(clReleaseEvent(read_event));
+    EXPECT_CL_SUCCESS(clReleaseEvent(gate));
+    EXPECT_CL_SUCCESS(clReleaseMemObject(shared));
+    EXPECT_CL_SUCCESS(clReleaseMemObject(source));
+}
+
+TEST_F(D3D11Sharing, FailedOpportunisticFlushKeepsAdmittedCommandAlive) {
+    constexpr size_t size = 64;
+    std::vector<uint8_t> initial(size, 0x73);
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(size);
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    D3D11_SUBRESOURCE_DATA data{initial.data(), 0, 0};
+    com_holder<ID3D11Buffer> d3d_buffer;
+    ASSERT_TRUE(
+        SUCCEEDED(m_d3d_device->CreateBuffer(&desc, &data, d3d_buffer.put())));
+
+    cl_int error;
+    cl_mem memory = clCreateFromD3D11BufferKHR(m_context, CL_MEM_READ_WRITE,
+                                               d3d_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(memory, nullptr);
+
+    cl_event acquire_event = nullptr;
+    {
+        auto max_first_group = CLVK_CONFIG_SCOPED_OVERRIDE(
+            max_first_cmd_group_size, uint32_t, 1, true);
+        auto fail_flush = CLVK_CONFIG_SCOPED_OVERRIDE(
+            force_command_queue_flush_failure, bool, true, true);
+        // The command and event have been admitted before the opportunistic
+        // flush. A transient flush allocation failure must therefore leave the
+        // enqueue successful rather than returning an error and deleting a
+        // command still owned by the queue.
+        EXPECT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(
+            m_queue, 1, &memory, 0, nullptr, &acquire_event));
+    }
+    ASSERT_NE(acquire_event, nullptr);
+    EXPECT_CL_SUCCESS(clFinish(m_queue));
+    cl_int event_status = CL_QUEUED;
+    EXPECT_CL_SUCCESS(
+        clGetEventInfo(acquire_event, CL_EVENT_COMMAND_EXECUTION_STATUS,
+                       sizeof(event_status), &event_status, nullptr));
+    EXPECT_EQ(event_status, CL_COMPLETE);
+
+    EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &memory, 0,
+                                                      nullptr, nullptr));
+    EXPECT_CL_SUCCESS(clReleaseEvent(acquire_event));
+    EXPECT_CL_SUCCESS(clReleaseMemObject(memory));
+}
+
+TEST_F(D3D11Sharing, FailedSynchronizedReleaseIsRetracted) {
+    constexpr size_t size = 64;
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(size);
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    com_holder<ID3D11Buffer> d3d_buffer;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateBuffer(&desc, nullptr, d3d_buffer.put())));
+
+    cl_int error;
+    cl_mem memory = clCreateFromD3D11BufferKHR(m_context, CL_MEM_READ_WRITE,
+                                               d3d_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(memory, nullptr);
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(m_queue, 1, &memory, 0,
+                                                      nullptr, nullptr));
+    ASSERT_CL_SUCCESS(clFinish(m_queue));
+
+    cl_event failed_event = nullptr;
+    {
+        auto fail_flush = CLVK_CONFIG_SCOPED_OVERRIDE(
+            force_command_queue_flush_failure, bool, true, true);
+        EXPECT_EQ(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &memory, 0,
+                                                  nullptr, &failed_event),
+                  CL_OUT_OF_HOST_MEMORY);
+    }
+    // An unsuccessful enqueue creates no event and must leave no latent
+    // release command. Ownership is immediately retryable.
+    EXPECT_EQ(failed_event, nullptr);
+    EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &memory, 0,
+                                                      nullptr, nullptr));
+
+    EXPECT_CL_SUCCESS(clReleaseMemObject(memory));
+}
+#endif
+
+TEST_F(D3D11Sharing, DynamicBufferRoundTrip) {
+    constexpr size_t size = 64;
+    std::vector<uint8_t> original(size);
+    for (size_t i = 0; i < size; i++) {
+        original[i] = static_cast<uint8_t>(i + 3);
+    }
+
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(size);
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    D3D11_SUBRESOURCE_DATA initial{original.data(), 0, 0};
+    com_holder<ID3D11Buffer> buffer;
+    ASSERT_TRUE(
+        SUCCEEDED(m_d3d_device->CreateBuffer(&desc, &initial, buffer.put())));
+
+    cl_int error;
+    cl_mem memory = clCreateFromD3D11BufferKHR(m_context, CL_MEM_READ_WRITE,
+                                               buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(memory, nullptr);
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(m_queue, 1, &memory, 0,
+                                                      nullptr, nullptr));
+
+    std::vector<uint8_t> acquired(size);
+    ASSERT_CL_SUCCESS(clEnqueueReadBuffer(m_queue, memory, CL_TRUE, 0, size,
+                                          acquired.data(), 0, nullptr,
+                                          nullptr));
+    EXPECT_EQ(acquired, original);
+    std::vector<uint8_t> replacement(size, 0x4d);
+    ASSERT_CL_SUCCESS(clEnqueueWriteBuffer(m_queue, memory, CL_TRUE, 0, size,
+                                           replacement.data(), 0, nullptr,
+                                           nullptr));
+    ASSERT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &memory, 0,
+                                                      nullptr, nullptr));
+
+    EXPECT_EQ(read_buffer(buffer.get(), size), replacement);
+    EXPECT_CL_SUCCESS(clReleaseMemObject(memory));
+}
+
+TEST_F(D3D11Sharing, DynamicTexture2DRoundTrip) {
+    constexpr UINT width = 7;
+    constexpr UINT height = 5;
+    constexpr size_t pixel_size = 4;
+    const size_t row_pitch = width * pixel_size;
+    std::vector<uint8_t> original(row_pitch * height);
+    for (size_t i = 0; i < original.size(); i++) {
+        original[i] = static_cast<uint8_t>(i ^ 0x96);
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    D3D11_SUBRESOURCE_DATA initial{original.data(),
+                                   static_cast<UINT>(row_pitch), 0};
+    com_holder<ID3D11Texture2D> texture;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateTexture2D(&desc, &initial, texture.put())));
+
+    cl_int error;
+    cl_mem image = clCreateFromD3D11Texture2DKHR(m_context, CL_MEM_READ_WRITE,
+                                                 texture.get(), 0, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(image, nullptr);
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(m_queue, 1, &image, 0,
+                                                      nullptr, nullptr));
+    const size_t origin[3] = {0, 0, 0};
+    const size_t region[3] = {width, height, 1};
+    std::vector<uint8_t> acquired(original.size());
+    ASSERT_CL_SUCCESS(clEnqueueReadImage(m_queue, image, CL_TRUE, origin,
+                                         region, row_pitch, 0, acquired.data(),
+                                         0, nullptr, nullptr));
+    EXPECT_EQ(acquired, original);
+
+    std::vector<uint8_t> replacement(original.size(), 0xb2);
+    ASSERT_CL_SUCCESS(
+        clEnqueueWriteImage(m_queue, image, CL_TRUE, origin, region, row_pitch,
+                            0, replacement.data(), 0, nullptr, nullptr));
+    ASSERT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &image, 0,
+                                                      nullptr, nullptr));
+
+    D3D11_TEXTURE2D_DESC staging_desc = desc;
+    staging_desc.Usage = D3D11_USAGE_STAGING;
+    staging_desc.BindFlags = 0;
+    staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    com_holder<ID3D11Texture2D> staging;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateTexture2D(&staging_desc, nullptr, staging.put())));
+    m_d3d_context->CopyResource(staging.get(), texture.get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &mapped)));
+    for (UINT y = 0; y < height; y++) {
+        EXPECT_EQ(
+            memcmp(static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch,
+                   replacement.data() + y * row_pitch, row_pitch),
+            0);
+    }
+    m_d3d_context->Unmap(staging.get(), 0);
+    EXPECT_CL_SUCCESS(clReleaseMemObject(image));
 }
 
 TEST_F(D3D11Sharing, Texture2DRoundTrip) {

@@ -296,4 +296,12 @@ OPTION(bool, force_cvk_command_buffer_end_error, false)
 
 // Control whether early flushing is enabled for unit tests.
 OPTION(bool, early_flush_enabled, true)
+
+// Force command queue flushing to fail after commands have been admitted, so
+// tests can verify enqueue/event ownership at the asynchronous flush boundary.
+OPTION(bool, force_command_queue_flush_failure, false)
+
+// Give the executor time to take ownership of a just-flushed group before
+// finish checks whether it can execute that group on the calling thread.
+OPTION(uint32_t, finish_executor_handoff_delay_ms, 0u)
 #endif

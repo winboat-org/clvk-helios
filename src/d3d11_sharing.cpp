@@ -252,6 +252,8 @@ struct cvk_d3d11_shared_resource::impl {
     size_t tight_row_pitch{0};
     size_t tight_slice_pitch{0};
     size_t tight_size{0};
+    D3D11_USAGE usage{D3D11_USAGE_DEFAULT};
+    UINT cpu_access_flags{0};
     std::mutex ownership_mutex;
     resource_owner physical_owner{resource_owner::d3d11};
     resource_owner logical_owner{resource_owner::d3d11};
@@ -274,7 +276,8 @@ std::shared_ptr<cvk_d3d11_shared_resource> cvk_d3d11_shared_resource::finish(
     cvk_d3d11_interop* interop, ID3D11Resource* resource,
     ID3D11Resource* staging, IUnknown* identity, cvk_d3d11_resource_kind kind,
     UINT subresource, size_t width, size_t height, size_t depth,
-    size_t element_size, cl_int* errcode_ret) {
+    size_t element_size, D3D11_USAGE usage, UINT cpu_access_flags,
+    cl_int* errcode_ret) {
     size_t row_pitch;
     size_t slice_pitch;
     size_t total_size;
@@ -327,6 +330,8 @@ std::shared_ptr<cvk_d3d11_shared_resource> cvk_d3d11_shared_resource::finish(
         shared->m_impl->tight_row_pitch = row_pitch;
         shared->m_impl->tight_slice_pitch = slice_pitch;
         shared->m_impl->tight_size = total_size;
+        shared->m_impl->usage = usage;
+        shared->m_impl->cpu_access_flags = cpu_access_flags;
         *errcode_ret = CL_SUCCESS;
         return shared;
     } catch (const std::bad_alloc&) {
@@ -401,7 +406,7 @@ cvk_d3d11_shared_resource::create_buffer(cvk_d3d11_interop* interop,
 
     return finish(interop, retained, staging, identity,
                   cvk_d3d11_resource_kind::buffer, 0, desc.ByteWidth, 1, 1, 1,
-                  errcode_ret);
+                  desc.Usage, desc.CPUAccessFlags, errcode_ret);
 }
 
 std::shared_ptr<cvk_d3d11_shared_resource>
@@ -485,7 +490,8 @@ cvk_d3d11_shared_resource::create_texture2d(cvk_d3d11_interop* interop,
 
     return finish(interop, retained, staging, identity,
                   cvk_d3d11_resource_kind::texture2d, subresource, width,
-                  height, 1, element_size, errcode_ret);
+                  height, 1, element_size, desc.Usage, desc.CPUAccessFlags,
+                  errcode_ret);
 }
 
 std::shared_ptr<cvk_d3d11_shared_resource>
@@ -565,7 +571,8 @@ cvk_d3d11_shared_resource::create_texture3d(cvk_d3d11_interop* interop,
 
     return finish(interop, retained, staging, identity,
                   cvk_d3d11_resource_kind::texture3d, subresource, width,
-                  height, depth, element_size, errcode_ret);
+                  height, depth, element_size, desc.Usage, desc.CPUAccessFlags,
+                  errcode_ret);
 }
 
 ID3D11Resource* cvk_d3d11_shared_resource::resource() const {
@@ -667,14 +674,28 @@ cl_int cvk_d3d11_shared_resource::copy_to_opencl(cvk_command_queue* queue,
     }
 
     auto* context = m_impl->interop->immediate_context();
-    context->CopySubresourceRegion(m_impl->staging, 0, 0, 0, 0,
-                                   m_impl->resource, m_impl->subresource,
-                                   nullptr);
-    context->Flush();
+    ID3D11Resource* mapped_resource = m_impl->staging;
+    UINT mapped_subresource = 0;
+    if (m_impl->usage == D3D11_USAGE_STAGING &&
+        (m_impl->cpu_access_flags & D3D11_CPU_ACCESS_READ) != 0) {
+        mapped_resource = m_impl->resource;
+        mapped_subresource = m_impl->subresource;
+    } else {
+        D3D11_BOX source_box{0,
+                             0,
+                             0,
+                             static_cast<UINT>(m_impl->width),
+                             static_cast<UINT>(m_impl->height),
+                             static_cast<UINT>(m_impl->depth)};
+        context->CopySubresourceRegion(m_impl->staging, 0, 0, 0, 0,
+                                       m_impl->resource, m_impl->subresource,
+                                       &source_box);
+        context->Flush();
+    }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT result =
-        context->Map(m_impl->staging, 0, D3D11_MAP_READ, 0, &mapped);
+    HRESULT result = context->Map(mapped_resource, mapped_subresource,
+                                  D3D11_MAP_READ, 0, &mapped);
     if (FAILED(result) || mapped.pData == nullptr) {
         return CL_OUT_OF_RESOURCES;
     }
@@ -692,7 +713,7 @@ cl_int cvk_d3d11_shared_resource::copy_to_opencl(cvk_command_queue* queue,
             }
         }
     }
-    context->Unmap(m_impl->staging, 0);
+    context->Unmap(mapped_resource, mapped_subresource);
 
     if (m_impl->kind == cvk_d3d11_resource_kind::buffer) {
         return clEnqueueWriteBuffer(queue, mem, CL_TRUE, 0, data.size(),
@@ -739,9 +760,27 @@ cl_int cvk_d3d11_shared_resource::copy_from_opencl(cvk_command_queue* queue,
     }
 
     auto* context = m_impl->interop->immediate_context();
+    ID3D11Resource* mapped_resource = m_impl->staging;
+    UINT mapped_subresource = 0;
+    D3D11_MAP map_type = D3D11_MAP_WRITE;
+    bool copy_staging_to_resource = true;
+    if (m_impl->usage == D3D11_USAGE_DYNAMIC) {
+        // Dynamic resources are CPU-write/GPU-read. They cannot be the
+        // destination of CopySubresourceRegion, so publish OpenCL writes via
+        // the mapping operation required by D3D11 for dynamic updates.
+        mapped_resource = m_impl->resource;
+        mapped_subresource = m_impl->subresource;
+        map_type = D3D11_MAP_WRITE_DISCARD;
+        copy_staging_to_resource = false;
+    } else if (m_impl->usage == D3D11_USAGE_STAGING &&
+               (m_impl->cpu_access_flags & D3D11_CPU_ACCESS_WRITE) != 0) {
+        mapped_resource = m_impl->resource;
+        mapped_subresource = m_impl->subresource;
+        copy_staging_to_resource = false;
+    }
     D3D11_MAPPED_SUBRESOURCE mapped{};
     HRESULT map_result =
-        context->Map(m_impl->staging, 0, D3D11_MAP_WRITE, 0, &mapped);
+        context->Map(mapped_resource, mapped_subresource, map_type, 0, &mapped);
     if (FAILED(map_result) || mapped.pData == nullptr) {
         return CL_OUT_OF_RESOURCES;
     }
@@ -760,10 +799,18 @@ cl_int cvk_d3d11_shared_resource::copy_from_opencl(cvk_command_queue* queue,
             }
         }
     }
-    context->Unmap(m_impl->staging, 0);
-    context->CopySubresourceRegion(m_impl->resource, m_impl->subresource, 0, 0,
-                                   0, m_impl->staging, 0, nullptr);
-    context->Flush();
+    context->Unmap(mapped_resource, mapped_subresource);
+    if (copy_staging_to_resource) {
+        D3D11_BOX source_box{0,
+                             0,
+                             0,
+                             static_cast<UINT>(m_impl->width),
+                             static_cast<UINT>(m_impl->height),
+                             static_cast<UINT>(m_impl->depth)};
+        context->CopySubresourceRegion(m_impl->resource, m_impl->subresource, 0,
+                                       0, 0, m_impl->staging, 0, &source_box);
+        context->Flush();
+    }
     return CL_SUCCESS;
 }
 

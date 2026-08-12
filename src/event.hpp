@@ -98,10 +98,10 @@ struct cvk_event_command : public cvk_event {
         cvk_debug_group(loggroup::event,
                         "cvk_event::wait: event = %p, status = %d", this,
                         m_status);
-        if ((m_status != CL_COMPLETE) && (m_status >= 0)) {
+        if (m_status > CL_COMPLETE) {
             TRACE_BEGIN_EVENT(command_type(), "queue", (uintptr_t)m_queue,
                               "command", (uintptr_t)m_cmd);
-            m_cv.wait(lock);
+            m_cv.wait(lock, [this] { return m_status <= CL_COMPLETE; });
             TRACE_END();
         }
 

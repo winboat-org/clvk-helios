@@ -17,6 +17,7 @@
 #include <array>
 #include <memory>
 #include <new>
+#include <system_error>
 
 #include "config.hpp"
 #include "event.hpp"
@@ -142,10 +143,9 @@ struct cvk_command_queue : public _cl_command_queue,
         return (m_properties & prop) == prop;
     }
 
-    CHECK_RETURN cl_int enqueue_command_with_deps(cvk_command* cmd,
-                                                  cl_uint num_dep_events,
-                                                  _cl_event* const* dep_events,
-                                                  _cl_event** event);
+    CHECK_RETURN cl_int enqueue_command_with_deps(
+        cvk_command* cmd, cl_uint num_dep_events, _cl_event* const* dep_events,
+        _cl_event** event, bool flush_before_return = false);
     CHECK_RETURN cl_int enqueue_command_with_deps(cvk_command* cmd,
                                                   bool blocking,
                                                   cl_uint num_dep_events,
@@ -243,9 +243,10 @@ struct cvk_command_queue : public _cl_command_queue,
 private:
     CHECK_RETURN cl_int satisfy_data_dependencies(cvk_command* cmd);
     CHECK_RETURN cl_int enqueue_command(cvk_command* cmd);
-    CHECK_RETURN cl_int enqueue_command_with_retry(cvk_command*,
-                                                   _cl_event** event);
-    CHECK_RETURN cl_int enqueue_command(cvk_command* cmd, _cl_event** event);
+    CHECK_RETURN cl_int enqueue_command_with_retry(
+        cvk_command*, _cl_event** event, bool flush_before_return = false);
+    CHECK_RETURN cl_int enqueue_command(cvk_command* cmd, _cl_event** event,
+                                        bool flush_before_return = false);
     CHECK_RETURN cl_int end_current_command_batch(bool from_flush = false);
     void executor();
 
@@ -317,11 +318,16 @@ struct cvk_executor_thread_pool {
         // Try to find a free executor
         for (auto& exec_state : m_executors) {
             if (exec_state.second == executor_state::free) {
-                exec_state.second = executor_state::bound;
                 auto exec = exec_state.first;
                 if (!exec->is_idle()) {
                     continue;
                 }
+                // A queue may return its executor while that executor is still
+                // unwinding the queue's final group. Do not consume the free
+                // pool entry until it is actually reusable, or every such
+                // race permanently strands an entry as bound and creates a
+                // new OS thread for the next short-lived queue.
+                exec_state.second = executor_state::bound;
                 return exec;
             }
         }

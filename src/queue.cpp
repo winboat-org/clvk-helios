@@ -154,9 +154,14 @@ cl_int cvk_command_queue::enqueue_command(cvk_command* cmd) {
 }
 
 cl_int cvk_command_queue::enqueue_command_with_retry(cvk_command* cmd,
-                                                     _cl_event** event) {
-    cl_int err = enqueue_command(cmd, event);
-    if (config.enqueue_command_retry_sleep_us == UINT32_MAX ||
+                                                     _cl_event** event,
+                                                     bool flush_before_return) {
+    cl_int err = enqueue_command(cmd, event, flush_before_return);
+    // The synchronizing path is used by a non-batchable ownership command and
+    // can only fail while submitting the already-built command. Retrying it
+    // would append a second implicit queue dependency to the same command.
+    if (flush_before_return ||
+        config.enqueue_command_retry_sleep_us == UINT32_MAX ||
         err != CL_OUT_OF_RESOURCES) {
         if (err != CL_SUCCESS) {
             delete cmd;
@@ -185,7 +190,7 @@ cl_int cvk_command_queue::enqueue_command_with_retry(cvk_command* cmd,
         std::this_thread::sleep_for(
             std::chrono::microseconds(config.enqueue_command_retry_sleep_us));
         TRACE_END();
-        err = enqueue_command(cmd, event);
+        err = enqueue_command(cmd, event, flush_before_return);
     } while (err == CL_OUT_OF_RESOURCES && m_nb_group_in_flight != 0);
     if (err != CL_SUCCESS) {
         delete cmd;
@@ -193,7 +198,8 @@ cl_int cvk_command_queue::enqueue_command_with_retry(cvk_command* cmd,
     return err;
 }
 
-cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event) {
+cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event,
+                                          bool flush_before_return) {
 
     cl_int err;
 
@@ -256,6 +262,20 @@ cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event) {
     cmd->event()->set_profiling_info_from_monotonic_clock(
         CL_PROFILING_COMMAND_QUEUED);
 
+    if (flush_before_return) {
+        // A synchronizing enqueue must know that its command was submitted
+        // before it can publish an event or report success. If submission
+        // fails, flush_no_lock leaves the group intact, so atomically retract
+        // this terminal command while m_lock still excludes other enqueues.
+        err = flush_no_lock();
+        if (err != CL_SUCCESS) {
+            CVK_ASSERT(!m_groups.back()->commands.empty());
+            CVK_ASSERT(m_groups.back()->commands.back() == cmd);
+            m_groups.back()->commands.pop_back();
+            return err;
+        }
+    }
+
     if (event != nullptr) {
         // The event will be returned to the app, retain it for the user
         cmd->event()->retain();
@@ -264,16 +284,29 @@ cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event) {
     }
 
 #ifdef CLVK_UNIT_TESTING_ENABLED
-    if (!config.early_flush_enabled) {
+    if (!config.early_flush_enabled || flush_before_return) {
         return CL_SUCCESS;
     }
 #endif
+
+    if (flush_before_return) {
+        return CL_SUCCESS;
+    }
 
     auto group_size = m_groups.back()->commands.size();
     if (group_size >= m_max_cmd_group_size ||
         (m_nb_group_in_flight == 0 &&
          group_size >= m_max_first_cmd_group_size)) {
-        return flush_no_lock();
+        // The command (and any user-visible event) has already been admitted
+        // to the queue. Early flushing is only an execution optimization: a
+        // failure here must not turn a successful enqueue into a failed one,
+        // because the caller would then destroy a command the queue owns. Keep
+        // the group queued and let an explicit flush/finish report any
+        // persistent failure.
+        err = flush_no_lock();
+        if (err != CL_SUCCESS) {
+            cvk_warn_fn("deferring failed opportunistic flush: %d", err);
+        }
     }
 
     return CL_SUCCESS;
@@ -281,13 +314,13 @@ cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event) {
 
 cl_int cvk_command_queue::enqueue_command_with_deps(
     cvk_command* cmd, cl_uint num_dep_events, _cl_event* const* dep_events,
-    _cl_event** event) {
+    _cl_event** event, bool flush_before_return) {
     if (!cmd->reserve_dependencies(static_cast<size_t>(num_dep_events) + 1)) {
         delete cmd;
         return CL_OUT_OF_HOST_MEMORY;
     }
     cmd->set_dependencies(num_dep_events, dep_events);
-    return enqueue_command_with_retry(cmd, event);
+    return enqueue_command_with_retry(cmd, event, flush_before_return);
 }
 
 cl_int cvk_command_queue::enqueue_command_with_deps(
@@ -536,6 +569,12 @@ cl_int cvk_command_queue::flush_no_lock() {
         return CL_SUCCESS;
     }
 
+#ifdef CLVK_UNIT_TESTING_ENABLED
+    if (config.force_command_queue_flush_failure()) {
+        return CL_OUT_OF_HOST_MEMORY;
+    }
+#endif
+
     // Allocate everything that may fail before transferring ownership of the
     // queued commands to the executor.
     std::unique_ptr<cvk_command_group> replacement;
@@ -546,6 +585,9 @@ cl_int cvk_command_queue::flush_no_lock() {
         }
     } catch (const std::bad_alloc&) {
         return CL_OUT_OF_HOST_MEMORY;
+    } catch (const std::system_error&) {
+        // std::thread reports OS thread-resource exhaustion this way.
+        return CL_OUT_OF_RESOURCES;
     }
 
     // Get the commands from the queue and prepare the queue to receive
@@ -589,14 +631,29 @@ cl_int cvk_command_queue::finish() {
     }
 
     if (m_finish_event != nullptr) {
-        _cl_event* evt_list = (_cl_event*)&*m_finish_event;
+        // Retain a stable terminal event while holding the queue lock. Command
+        // callbacks may enqueue and flush more work onto this same queue.
+        cvk_event_holder finish_event(m_finish_event);
+#ifdef CLVK_UNIT_TESTING_ENABLED
+        if (config.finish_executor_handoff_delay_ms() != 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                config.finish_executor_handoff_delay_ms()));
+        }
+#endif
+        _cl_event* evt_list = (_cl_event*)&*finish_event;
         status = execute_cmds_required_by_no_lock(1, &evt_list, lock);
-        cl_int event_status = m_finish_event->wait();
+        // execute_cmds_required_by_no_lock returns with m_lock held. Never
+        // wait for completion callbacks while holding it: a callback is
+        // allowed to enqueue more commands onto this queue.
+        lock.unlock();
+        cl_int event_status = finish_event->wait();
         if (status != CL_SUCCESS) {
-            return status;
+            return status == CL_OUT_OF_HOST_MEMORY ? status
+                                                   : CL_OUT_OF_RESOURCES;
         }
         if (event_status != CL_COMPLETE) {
-            return event_status;
+            return event_status == CL_OUT_OF_HOST_MEMORY ? event_status
+                                                         : CL_OUT_OF_RESOURCES;
         }
     }
 

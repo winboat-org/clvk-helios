@@ -5215,8 +5215,13 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
         }
         return CL_OUT_OF_HOST_MEMORY;
     }
+    const bool synchronized_release =
+        !acquire && !queue->context()->interop_user_sync();
+    _cl_event* synchronized_event = nullptr;
     cl_int result = queue->enqueue_command_with_deps(
-        command, num_events_in_wait_list, event_wait_list, event);
+        command, num_events_in_wait_list, event_wait_list,
+        synchronized_release ? &synchronized_event : event,
+        synchronized_release);
     if (result != CL_SUCCESS) {
         for (auto* object : objects) {
             auto& shared = object->d3d11_shared();
@@ -5225,6 +5230,12 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
             } else {
                 shared->cancel_release();
             }
+        }
+        // The D3D11 sharing entry points expose allocation failure as
+        // CL_OUT_OF_HOST_MEMORY; they do not include CL_OUT_OF_RESOURCES in
+        // their exhaustive error set.
+        if (result == CL_OUT_OF_RESOURCES) {
+            result = CL_OUT_OF_HOST_MEMORY;
         }
     }
     // Command callbacks run synchronously on the thread that completes their
@@ -5235,11 +5246,22 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
     reservation_lock.unlock();
     // With CPU-backed interop there is no semaphore that can make future
     // D3D11 submissions wait on this queue. Unless the application opted into
-    // explicit synchronization, complete a release before returning so a
-    // D3D11 call made immediately afterwards observes the OpenCL writes.
-    if (result == CL_SUCCESS && !acquire &&
-        !queue->context()->interop_user_sync()) {
-        result = queue->finish();
+    // explicit synchronization, complete this exact release before returning
+    // so a D3D11 call made immediately afterwards observes the OpenCL writes.
+    // Waiting on the whole queue would allow an unrelated command enqueued by
+    // another host thread to change this API call's result.
+    if (result == CL_SUCCESS && synchronized_release) {
+        // flush_before_return guarantees submission, so waiting directly on
+        // this retained event cannot pick up unrelated work enqueued later.
+        // Execution failure is reported by the terminal event (and clFinish),
+        // while this successfully submitted enqueue keeps its specified API
+        // return value and event-creation semantics.
+        icd_downcast(synchronized_event)->wait();
+        if (event != nullptr) {
+            *event = synchronized_event;
+        } else {
+            icd_downcast(synchronized_event)->release();
+        }
     }
     return result;
 }
