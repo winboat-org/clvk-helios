@@ -390,10 +390,24 @@ cl_int cvk_image::init_vulkan_gl_image() {
 
     VkMemoryRequirements requirements;
     vkGetImageMemoryRequirements(vkdev, m_image, &requirements);
+    // Zink may place the resource at a non-zero offset inside its allocation.
+    // The alias image has to be bound at that same offset, and the region from
+    // it has to be big enough and correctly aligned; binding at zero instead
+    // would silently alias the wrong bytes.
+    const bool offset_misaligned =
+        requirements.alignment != 0 &&
+        (shared.memory_offset % requirements.alignment) != 0;
+    const bool region_too_small =
+        shared.memory_offset > shared.allocation_size ||
+        (shared.allocation_size - shared.memory_offset) < requirements.size;
     if (shared.memory_type_index >= VK_MAX_MEMORY_TYPES ||
         !(requirements.memoryTypeBits & (1u << shared.memory_type_index)) ||
-        shared.allocation_size < requirements.size) {
-        cvk_error_fn("imported GL memory is incompatible with the alias image");
+        offset_misaligned || region_too_small) {
+        cvk_error_fn("imported GL memory is incompatible with the alias image "
+                     "(type %u, offset %lu, alloc %lu, needs %lu align %lu)",
+                     shared.memory_type_index, shared.memory_offset,
+                     shared.allocation_size, requirements.size,
+                     requirements.alignment);
         return CL_MEM_OBJECT_ALLOCATION_FAILURE;
     }
 
@@ -409,7 +423,8 @@ cl_int cvk_image::init_vulkan_gl_image() {
         return CL_MEM_OBJECT_ALLOCATION_FAILURE;
     }
 
-    result = vkBindImageMemory(vkdev, m_image, m_memory->vulkan_memory(), 0);
+    result = vkBindImageMemory(vkdev, m_image, m_memory->vulkan_memory(),
+                               shared.memory_offset);
     if (result != VK_SUCCESS) {
         cvk_error_fn("could not bind imported GL memory (%d)", result);
         return CL_MEM_OBJECT_ALLOCATION_FAILURE;

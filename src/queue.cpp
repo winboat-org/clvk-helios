@@ -1944,8 +1944,17 @@ cvk_command_gl_objects::build_batchable_inner(cvk_command_buffer& cmdbuf) {
             src_access = 0;
             dst_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         } else {
-            src_queue = queue_family;
-            dst_queue = VK_QUEUE_FAMILY_EXTERNAL;
+            // Mirror what the acquire did: if the image was taken without an
+            // ownership transfer, releasing it with one would leave an
+            // unmatched half of a transfer pair.
+            if (exported.zink.released_queue_family ==
+                VK_QUEUE_FAMILY_IGNORED) {
+                src_queue = VK_QUEUE_FAMILY_IGNORED;
+                dst_queue = VK_QUEUE_FAMILY_IGNORED;
+            } else {
+                src_queue = queue_family;
+                dst_queue = VK_QUEUE_FAMILY_EXTERNAL;
+            }
             old_layout = VK_IMAGE_LAYOUT_GENERAL;
             new_layout = static_cast<VkImageLayout>(exported.zink.layout);
             if (new_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
