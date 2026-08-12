@@ -42,12 +42,6 @@ public:
     ID3D11DeviceContext* immediate_context() const;
     bool owns_resource(ID3D11Resource* resource) const;
 
-    // ID3D11DeviceContext is not thread-safe. These methods enter the D3D
-    // runtime's device-wide critical section, which also serializes calls made
-    // by the application and by other OpenCL contexts using the same device.
-    void lock();
-    void unlock();
-
 private:
     struct impl;
     std::unique_ptr<impl> m_impl;

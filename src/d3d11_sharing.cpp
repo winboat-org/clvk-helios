@@ -238,10 +238,6 @@ bool cvk_d3d11_interop::owns_resource(ID3D11Resource* resource) const {
     return result;
 }
 
-void cvk_d3d11_interop::lock() { m_impl->multithread->Enter(); }
-
-void cvk_d3d11_interop::unlock() { m_impl->multithread->Leave(); }
-
 struct cvk_d3d11_shared_resource::impl {
     cvk_d3d11_interop* interop{nullptr};
     cvk_d3d11_resource_kind kind{cvk_d3d11_resource_kind::buffer};
@@ -670,36 +666,33 @@ cl_int cvk_d3d11_shared_resource::copy_to_opencl(cvk_command_queue* queue,
         return CL_OUT_OF_HOST_MEMORY;
     }
 
-    {
-        std::lock_guard<cvk_d3d11_interop> lock(*m_impl->interop);
-        auto* context = m_impl->interop->immediate_context();
-        context->CopySubresourceRegion(m_impl->staging, 0, 0, 0, 0,
-                                       m_impl->resource, m_impl->subresource,
-                                       nullptr);
-        context->Flush();
+    auto* context = m_impl->interop->immediate_context();
+    context->CopySubresourceRegion(m_impl->staging, 0, 0, 0, 0,
+                                   m_impl->resource, m_impl->subresource,
+                                   nullptr);
+    context->Flush();
 
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        HRESULT result =
-            context->Map(m_impl->staging, 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(result) || mapped.pData == nullptr) {
-            return CL_OUT_OF_RESOURCES;
-        }
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT result =
+        context->Map(m_impl->staging, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(result) || mapped.pData == nullptr) {
+        return CL_OUT_OF_RESOURCES;
+    }
 
-        if (m_impl->kind == cvk_d3d11_resource_kind::buffer) {
-            memcpy(data.data(), mapped.pData, m_impl->tight_size);
-        } else {
-            auto* source = static_cast<const uint8_t*>(mapped.pData);
-            for (size_t z = 0; z < m_impl->depth; z++) {
-                for (size_t y = 0; y < m_impl->height; y++) {
-                    memcpy(data.data() + z * m_impl->tight_slice_pitch +
-                               y * m_impl->tight_row_pitch,
-                           source + z * mapped.DepthPitch + y * mapped.RowPitch,
-                           m_impl->tight_row_pitch);
-                }
+    if (m_impl->kind == cvk_d3d11_resource_kind::buffer) {
+        memcpy(data.data(), mapped.pData, m_impl->tight_size);
+    } else {
+        auto* source = static_cast<const uint8_t*>(mapped.pData);
+        for (size_t z = 0; z < m_impl->depth; z++) {
+            for (size_t y = 0; y < m_impl->height; y++) {
+                memcpy(data.data() + z * m_impl->tight_slice_pitch +
+                           y * m_impl->tight_row_pitch,
+                       source + z * mapped.DepthPitch + y * mapped.RowPitch,
+                       m_impl->tight_row_pitch);
             }
         }
-        context->Unmap(m_impl->staging, 0);
     }
+    context->Unmap(m_impl->staging, 0);
 
     if (m_impl->kind == cvk_d3d11_resource_kind::buffer) {
         return clEnqueueWriteBuffer(queue, mem, CL_TRUE, 0, data.size(),
@@ -745,7 +738,6 @@ cl_int cvk_d3d11_shared_resource::copy_from_opencl(cvk_command_queue* queue,
         return result;
     }
 
-    std::lock_guard<cvk_d3d11_interop> lock(*m_impl->interop);
     auto* context = m_impl->interop->immediate_context();
     D3D11_MAPPED_SUBRESOURCE mapped{};
     HRESULT map_result =
