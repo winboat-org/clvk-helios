@@ -304,4 +304,8 @@ OPTION(bool, force_command_queue_flush_failure, false)
 // Give the executor time to take ownership of a just-flushed group before
 // finish checks whether it can execute that group on the calling thread.
 OPTION(uint32_t, finish_executor_handoff_delay_ms, 0u)
+
+// Force creation of the internal OpenCL backing object for an imported D3D11
+// resource to fail, so the extension's public error mapping can be tested.
+OPTION(bool, force_d3d11_backing_allocation_failure, false)
 #endif

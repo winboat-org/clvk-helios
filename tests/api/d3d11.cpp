@@ -15,6 +15,7 @@
 #include "testcl.hpp"
 
 #include <CL/cl_d3d11.h>
+#include <CL/cl_gl.h>
 #include <d3d11.h>
 #include <d3d11_4.h>
 
@@ -163,6 +164,13 @@ TEST_F(D3D11Sharing, AssociationEntrypointsAndBufferRoundTrip) {
                   gPlatform, "clEnqueueReleaseD3D11ObjectsKHR"),
               nullptr);
 
+    cl_uint ignored_num_devices = 0;
+    EXPECT_EQ(clGetDeviceIDsFromD3D11KHR(
+                  gPlatform, CL_D3D11_DEVICE_KHR, nullptr,
+                  CL_ALL_DEVICES_FOR_D3D11_KHR, 0, nullptr,
+                  &ignored_num_devices),
+              CL_DEVICE_NOT_FOUND);
+
     cl_device_id associated = nullptr;
     cl_uint num_devices = 0;
     ASSERT_CL_SUCCESS(clGetDeviceIDsFromD3D11KHR(
@@ -293,6 +301,41 @@ TEST_F(D3D11Sharing, RejectsSingleThreadedD3D11Device) {
         clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &error);
     EXPECT_EQ(context, nullptr);
     EXPECT_EQ(error, CL_INVALID_D3D11_DEVICE_KHR);
+}
+
+TEST_F(D3D11Sharing, ExplicitNullD3D11DeviceUsesDefaultContext) {
+    const cl_context_properties properties[] = {
+        CL_CONTEXT_PLATFORM,
+        reinterpret_cast<cl_context_properties>(gPlatform),
+        CL_CONTEXT_D3D11_DEVICE_KHR,
+        0,
+        0,
+    };
+    cl_int error;
+    cl_context context =
+        clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(context, nullptr);
+    EXPECT_CL_SUCCESS(clReleaseContext(context));
+}
+
+TEST_F(D3D11Sharing, RejectsCombinedD3D11AndGlSharingContext) {
+    const cl_context_properties properties[] = {
+        CL_CONTEXT_PLATFORM,
+        reinterpret_cast<cl_context_properties>(gPlatform),
+        CL_CONTEXT_D3D11_DEVICE_KHR,
+        reinterpret_cast<cl_context_properties>(m_d3d_device.get()),
+        CL_GL_CONTEXT_KHR,
+        1,
+        CL_WGL_HDC_KHR,
+        1,
+        0,
+    };
+    cl_int error;
+    cl_context context =
+        clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &error);
+    EXPECT_EQ(context, nullptr);
+    EXPECT_EQ(error, CL_INVALID_OPERATION);
 }
 
 TEST_F(D3D11Sharing, KernelAccessFlagsDoNotElideOwnershipCopies) {
@@ -495,6 +538,56 @@ TEST_F(D3D11Sharing, EventCallbackCanReenterOwnershipApisDuringRelease) {
 }
 
 #ifdef CLVK_UNIT_TESTING_ENABLED
+TEST_F(D3D11Sharing, BackingAllocationFailuresUseExtensionError) {
+    D3D11_BUFFER_DESC buffer_desc{};
+    buffer_desc.ByteWidth = 64;
+    buffer_desc.Usage = D3D11_USAGE_DEFAULT;
+    com_holder<ID3D11Buffer> buffer;
+    ASSERT_TRUE(SUCCEEDED(m_d3d_device->CreateBuffer(
+        &buffer_desc, nullptr, buffer.put())));
+
+    D3D11_TEXTURE2D_DESC texture_desc{};
+    texture_desc.Width = 4;
+    texture_desc.Height = 4;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+    com_holder<ID3D11Texture2D> texture;
+    ASSERT_TRUE(SUCCEEDED(m_d3d_device->CreateTexture2D(
+        &texture_desc, nullptr, texture.put())));
+
+    {
+        auto fail_backing = CLVK_CONFIG_SCOPED_OVERRIDE(
+            force_d3d11_backing_allocation_failure, bool, true, true);
+        cl_int error = CL_SUCCESS;
+        EXPECT_EQ(clCreateFromD3D11BufferKHR(
+                      m_context, CL_MEM_READ_WRITE, buffer.get(), &error),
+                  nullptr);
+        EXPECT_EQ(error, CL_OUT_OF_HOST_MEMORY);
+        error = CL_SUCCESS;
+        EXPECT_EQ(clCreateFromD3D11Texture2DKHR(
+                      m_context, CL_MEM_READ_WRITE, texture.get(), 0, &error),
+                  nullptr);
+        EXPECT_EQ(error, CL_OUT_OF_HOST_MEMORY);
+    }
+
+    // Failed backing allocation must also release the temporary duplicate
+    // registration so the same D3D resources remain importable.
+    cl_int error;
+    cl_mem buffer_memory = clCreateFromD3D11BufferKHR(
+        m_context, CL_MEM_READ_WRITE, buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(buffer_memory, nullptr);
+    cl_mem image_memory = clCreateFromD3D11Texture2DKHR(
+        m_context, CL_MEM_READ_WRITE, texture.get(), 0, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(image_memory, nullptr);
+    EXPECT_CL_SUCCESS(clReleaseMemObject(image_memory));
+    EXPECT_CL_SUCCESS(clReleaseMemObject(buffer_memory));
+}
+
 TEST_F(D3D11Sharing, FinishAllowsSameQueueCallbackEnqueue) {
     constexpr size_t size = 64;
     std::vector<uint8_t> input(size, 0x27);

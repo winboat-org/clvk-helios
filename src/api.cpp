@@ -649,7 +649,10 @@ cl_int CLVK_API_CALL clGetDeviceIDsFromD3D11KHR(
     DXGI_ADAPTER_DESC adapter_desc{};
     if (!cvk_get_d3d11_adapter_desc(d3d_device_source, d3d_object,
                                     &adapter_desc)) {
-        return CL_INVALID_D3D11_DEVICE_KHR;
+        // The query API reports an unresolved D3D11 object as having no
+        // corresponding OpenCL device. CL_INVALID_D3D11_DEVICE_KHR is only a
+        // context-creation error in cl_khr_d3d11_sharing.
+        return CL_DEVICE_NOT_FOUND;
     }
 
     static_assert(sizeof(adapter_desc.AdapterLuid) == CL_LUID_SIZE_KHR,
@@ -5024,11 +5027,23 @@ cl_mem CLVK_API_CALL clCreateFromD3D11BufferKHR(cl_context context,
                 auto shared = cvk_d3d11_shared_resource::create_buffer(
                     ctx->d3d11_interop(), resource, &err);
                 if (shared != nullptr) {
-                    auto created = cvk_buffer::create(
-                        ctx, flags, shared->size(), nullptr, &err);
+                    std::unique_ptr<cvk_buffer> created;
+#ifdef CLVK_UNIT_TESTING_ENABLED
+                    if (config.force_d3d11_backing_allocation_failure()) {
+                        err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+                    } else
+#endif
+                    {
+                        created = cvk_buffer::create(
+                            ctx, flags, shared->size(), nullptr, &err);
+                    }
                     if (created != nullptr) {
                         created->set_d3d11_shared(std::move(shared));
                         buffer = created.release();
+                    } else {
+                        // The D3D11 extension exposes backing-allocation
+                        // failures only as CL_OUT_OF_HOST_MEMORY.
+                        err = CL_OUT_OF_HOST_MEMORY;
                     }
                 }
             }
@@ -5076,14 +5091,25 @@ cl_mem create_from_d3d11_texture(cl_context context, cl_mem_flags flags,
                 }
                 if (shared != nullptr) {
                     std::vector<cl_mem_properties> properties;
-                    image =
-                        cvk_image::create(ctx, flags, &desc, &format, nullptr,
-                                          std::move(properties), &err);
-                    if (err == CL_IMAGE_FORMAT_NOT_SUPPORTED) {
-                        err = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
+#ifdef CLVK_UNIT_TESTING_ENABLED
+                    if (config.force_d3d11_backing_allocation_failure()) {
+                        err = CL_MEM_OBJECT_ALLOCATION_FAILURE;
+                    } else
+#endif
+                    {
+                        image = cvk_image::create(
+                            ctx, flags, &desc, &format, nullptr,
+                            std::move(properties), &err);
                     }
                     if (image != nullptr) {
                         image->set_d3d11_shared(std::move(shared));
+                    } else if (err == CL_IMAGE_FORMAT_NOT_SUPPORTED) {
+                        err = CL_INVALID_IMAGE_FORMAT_DESCRIPTOR;
+                    } else {
+                        // Resource validation and D3D/CL format mapping have
+                        // already succeeded. Any remaining backing-object
+                        // failure uses the extension's only allocation error.
+                        err = CL_OUT_OF_HOST_MEMORY;
                     }
                 }
             }
