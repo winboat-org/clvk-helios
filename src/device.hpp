@@ -15,6 +15,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -250,6 +251,49 @@ struct cvk_device : public _cl_device_id,
                  config.percentage_of_available_memory_reported());
 
         return size * percentage_of_available_memory_reported;
+    }
+
+    // Total device memory clvk is willing to have live at once. Zero means the
+    // accounting is disabled and the Vulkan implementation decides.
+    uint64_t memory_budget() const {
+        auto percent = config.memory_budget_percent();
+        if (percent == 0) {
+            return 0;
+        }
+        return (global_mem_size() / 100) * percent;
+    }
+
+    // Reserves |size| bytes against the budget. Returns false if that would
+    // take the device over it, in which case nothing is reserved.
+    bool CHECK_RETURN try_reserve_memory(uint64_t size) {
+        auto budget = memory_budget();
+        if (budget == 0) {
+            return true;
+        }
+        uint64_t in_use = m_memory_in_use.load(std::memory_order_relaxed);
+        while (true) {
+            if (size > budget || in_use > budget - size) {
+                cvk_warn("refusing a %s allocation: %s of %s already in use",
+                         pretty_size(size).c_str(), pretty_size(in_use).c_str(),
+                         pretty_size(budget).c_str());
+                return false;
+            }
+            if (m_memory_in_use.compare_exchange_weak(
+                    in_use, in_use + size, std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+    }
+
+    void release_memory(uint64_t size) {
+        if (memory_budget() == 0) {
+            return;
+        }
+        m_memory_in_use.fetch_sub(size, std::memory_order_relaxed);
+    }
+
+    uint64_t memory_in_use() const {
+        return m_memory_in_use.load(std::memory_order_relaxed);
     }
 
     uint64_t max_mem_alloc_size() const {
@@ -794,6 +838,7 @@ private:
     // Properties
     VkPhysicalDeviceProperties m_properties;
     VkPhysicalDeviceMaintenance3Properties m_maintenance3_properties;
+    std::atomic<uint64_t> m_memory_in_use{0};
     VkPhysicalDeviceMemoryProperties m_mem_properties;
     VkPhysicalDeviceDriverPropertiesKHR m_driver_properties;
     VkPhysicalDeviceIDPropertiesKHR m_device_id_properties;

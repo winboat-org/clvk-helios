@@ -27,11 +27,16 @@
 
 struct cvk_memory_allocation {
 
+    // |budget_device| is the device this allocation is charged to, or nullptr
+    // for memory clvk does not own -- imported external memory in particular,
+    // which lives in another API's heap and must not be counted twice.
     cvk_memory_allocation(VkDevice dev, VkDeviceSize size, uint32_t type_index,
-                          bool coherent, bool keep_mapping)
+                          bool coherent, bool keep_mapping,
+                          cvk_device* budget_device = nullptr)
         : m_device(dev), m_size(size), m_memory(VK_NULL_HANDLE),
           m_memory_type_index(type_index), m_coherent(coherent),
-          m_keep_mapping(keep_mapping), m_map_ptr(nullptr) {}
+          m_keep_mapping(keep_mapping), m_map_ptr(nullptr),
+          m_budget_device(budget_device), m_reserved(false) {}
 
     ~cvk_memory_allocation() {
         if (m_keep_mapping && m_map_ptr != nullptr) {
@@ -39,6 +44,9 @@ struct cvk_memory_allocation {
         }
         if (m_memory != VK_NULL_HANDLE) {
             vkFreeMemory(m_device, m_memory, nullptr);
+        }
+        if (m_reserved) {
+            m_budget_device->release_memory(m_size);
         }
     }
 
@@ -54,7 +62,23 @@ struct cvk_memory_allocation {
             m_memory_type_index,
         };
 
-        return vkAllocateMemory(m_device, &memoryAllocateInfo, 0, &m_memory);
+        // Charge the budget before asking Vulkan. Some implementations accept
+        // allocations well past the heap they advertise and fail elsewhere,
+        // long after the application could have reacted.
+        if (m_budget_device != nullptr && !m_reserved) {
+            if (!m_budget_device->try_reserve_memory(m_size)) {
+                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
+            m_reserved = true;
+        }
+
+        auto res =
+            vkAllocateMemory(m_device, &memoryAllocateInfo, 0, &m_memory);
+        if (res != VK_SUCCESS && m_reserved) {
+            m_budget_device->release_memory(m_size);
+            m_reserved = false;
+        }
+        return res;
     }
 
 #ifdef _WIN32
@@ -130,6 +154,8 @@ private:
     bool m_coherent;
     bool m_keep_mapping;
     void* m_map_ptr;
+    cvk_device* m_budget_device;
+    bool m_reserved;
 };
 
 using cvk_mem_callback_pointer_type = void(CL_CALLBACK*)(cl_mem mem,
@@ -536,7 +562,13 @@ struct cvk_buffer : public cvk_mem {
 private:
     bool init();
 
+    // True when init() failed specifically because device memory could not be
+    // obtained, so clCreateBuffer can report CL_MEM_OBJECT_ALLOCATION_FAILURE
+    // rather than flattening every failure to CL_OUT_OF_RESOURCES.
+    bool allocation_failed() const { return m_allocation_failed; }
+
     VkBuffer m_buffer;
+    bool m_allocation_failed = false;
     std::unordered_map<void*, cvk_buffer_mapping> m_mappings;
     std::mutex m_mappings_lock;
 };

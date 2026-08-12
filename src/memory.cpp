@@ -89,7 +89,11 @@ cvk_buffer::create(cvk_context* context, cl_mem_flags flags, size_t size,
         context, flags, size, host_ptr, nullptr, 0, std::move(properties));
 
     if (!buffer->init()) {
-        *errcode_ret = CL_OUT_OF_RESOURCES;
+        // The spec distinguishes "could not get memory for this object" from a
+        // generic failure, and applications back off on the former.
+        *errcode_ret = buffer->allocation_failed()
+                           ? CL_MEM_OBJECT_ALLOCATION_FAILURE
+                           : CL_OUT_OF_RESOURCES;
         return nullptr;
     }
 
@@ -129,10 +133,12 @@ bool cvk_buffer::init() {
     // Allocate memory
     m_memory = std::make_shared<cvk_memory_allocation>(
         vkdev, params.size, params.memory_type_index, params.memory_coherent,
-        device->keep_memory_allocations_mapped());
+        device->keep_memory_allocations_mapped(), device);
     res = m_memory->allocate(device->uses_physical_addressing());
 
     if (res != VK_SUCCESS) {
+        m_allocation_failed = res == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+                              res == VK_ERROR_OUT_OF_HOST_MEMORY;
         return false;
     }
 

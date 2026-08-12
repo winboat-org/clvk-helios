@@ -117,6 +117,20 @@ OPTION(bool, supports_filter_linear, true)
 // Specify the percentage of the available memory to be reported.
 OPTION(uint32_t, percentage_of_available_memory_reported, 100u)
 
+// Refuse device memory allocations once the total live allocation would exceed
+// this percentage of the reported global memory size, returning
+// CL_MEM_OBJECT_ALLOCATION_FAILURE instead of asking Vulkan for memory the
+// device does not have. Set to 0 to disable the accounting entirely and let
+// the Vulkan implementation decide.
+//
+// This defaults to on because some implementations accept allocations far
+// beyond the heap they advertise and only fail much later, outside the
+// application's control: on virtio-gpu/Venus, 32 GB of buffers were accepted
+// against a 4 GB heap and the *host* GPU ran out of memory, taking the display
+// down with it. An application that is told every allocation succeeded has no
+// way to back off.
+OPTION(uint32_t, memory_budget_percent, 100u)
+
 // Specify the maximum allowed memory allocation size in megabytes.
 OPTION(uint32_t, max_mem_alloc_size_mb, 1024u)
 

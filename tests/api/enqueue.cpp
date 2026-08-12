@@ -626,3 +626,50 @@ TEST_F(WithCommandQueue, UnmapReadOnlyMappingDoesNotWriteBack) {
         ASSERT_EQ(readback[i], static_cast<cl_uint>(i));
     }
 }
+
+// An implementation that advertises a global memory size must not keep
+// accepting allocations far beyond it. Some Vulkan implementations do, and fail
+// only much later and out of the application's sight -- on virtio-gpu/Venus,
+// 32 GB of buffers were accepted against a 4 GB heap and the host GPU ran out
+// of memory instead. The application has to be told, so it can back off.
+TEST_F(WithCommandQueue, AllocationsBeyondGlobalMemoryAreRefused) {
+    cl_ulong global_size = 0;
+    GetDeviceInfo(CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(global_size), &global_size,
+                  nullptr);
+    ASSERT_GT(global_size, 0u);
+
+    // A chunk small enough to be individually legal, big enough that a bounded
+    // number of them covers the heap twice over.
+    cl_ulong max_alloc = 0;
+    GetDeviceInfo(CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof(max_alloc), &max_alloc,
+                  nullptr);
+    const size_t chunk = static_cast<size_t>(
+        std::min<cl_ulong>(max_alloc, std::max<cl_ulong>(global_size / 16, 1)));
+    ASSERT_GT(chunk, 0u);
+
+    // Raw handles, released explicitly: a vector of RAII holders would release
+    // buffers as it reallocates, so nothing would ever accumulate.
+    std::vector<cl_mem> buffers;
+    bool refused = false;
+    // Twice the heap is enough to prove the point without unbounded looping.
+    const size_t attempts = static_cast<size_t>((global_size / chunk) * 2 + 2);
+    for (size_t i = 0; i < attempts; i++) {
+        cl_int err = CL_SUCCESS;
+        auto mem =
+            clCreateBuffer(m_context, CL_MEM_READ_WRITE, chunk, nullptr, &err);
+        if (err != CL_SUCCESS) {
+            ASSERT_EQ(err, CL_MEM_OBJECT_ALLOCATION_FAILURE);
+            refused = true;
+            break;
+        }
+        buffers.push_back(mem);
+    }
+    const size_t created = buffers.size();
+    for (auto mem : buffers) {
+        clReleaseMemObject(mem);
+    }
+    ASSERT_TRUE(refused)
+        << "allocated " << created << " x " << chunk
+        << " bytes without ever being refused, against a reported heap of "
+        << global_size;
+}
