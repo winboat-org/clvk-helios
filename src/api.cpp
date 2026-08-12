@@ -5184,6 +5184,14 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
             shared->finish_release(result == CL_SUCCESS);
         }
     }
+    // With CPU-backed interop there is no semaphore that can make future
+    // D3D11 submissions wait on this queue. Unless the application opted into
+    // explicit synchronization, complete a release before returning so a
+    // D3D11 call made immediately afterwards observes the OpenCL writes.
+    if (result == CL_SUCCESS && !acquire &&
+        !queue->context()->interop_user_sync()) {
+        result = queue->finish();
+    }
     return result;
 }
 

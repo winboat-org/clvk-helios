@@ -297,7 +297,6 @@ TEST_F(D3D11Sharing, Texture2DRoundTrip) {
         replacement.data(), 0, nullptr, nullptr));
     ASSERT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &image, 0,
                                                       nullptr, nullptr));
-    ASSERT_CL_SUCCESS(clFinish(m_queue));
 
     D3D11_TEXTURE2D_DESC staging_desc = desc;
     staging_desc.Usage = D3D11_USAGE_STAGING;
@@ -370,7 +369,6 @@ TEST_F(D3D11Sharing, Texture3DRoundTrip) {
         replacement.data(), 0, nullptr, nullptr));
     ASSERT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(m_queue, 1, &image, 0,
                                                       nullptr, nullptr));
-    ASSERT_CL_SUCCESS(clFinish(m_queue));
 
     D3D11_TEXTURE3D_DESC staging_desc = desc;
     staging_desc.Usage = D3D11_USAGE_STAGING;
