@@ -198,7 +198,11 @@ cl_int cvk_command_queue::enqueue_command(cvk_command* cmd, _cl_event** event) {
     cl_int err;
 
     // Enqueue data movement/consistency commands if needed
-    err = satisfy_data_dependencies(cmd);
+    try {
+        err = satisfy_data_dependencies(cmd);
+    } catch (const std::bad_alloc&) {
+        return CL_OUT_OF_HOST_MEMORY;
+    }
     if (err != CL_SUCCESS) {
         return err;
     }

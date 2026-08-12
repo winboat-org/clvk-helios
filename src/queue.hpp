@@ -1168,7 +1168,14 @@ struct cvk_command_d3d11_objects final : public cvk_command {
         }
     }
 
-    bool is_data_movement() const override { return true; }
+    const std::vector<cvk_mem*> memory_objects() const override {
+        std::vector<cvk_mem*> objects;
+        objects.reserve(m_objects.size());
+        for (const auto& object : m_objects) {
+            objects.push_back(object);
+        }
+        return objects;
+    }
 
     void set_event_status(cl_int status) override {
         if (status <= CL_COMPLETE && !m_ownership_finalized) {
