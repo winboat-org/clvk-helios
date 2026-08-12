@@ -19,9 +19,12 @@
 #include <d3d11_4.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -44,6 +47,23 @@ public:
 private:
     T* m_object{nullptr};
 };
+
+struct callback_acquire_data {
+    cl_command_queue queue;
+    cl_mem memory;
+    std::atomic<cl_int> result{CL_INVALID_OPERATION};
+};
+
+void CL_CALLBACK acquire_d3d11_from_callback(cl_event, cl_int status,
+                                             void* user_data) {
+    auto* data = static_cast<callback_acquire_data*>(user_data);
+    if (status != CL_COMPLETE) {
+        data->result.store(status);
+        return;
+    }
+    data->result.store(clEnqueueAcquireD3D11ObjectsKHR(
+        data->queue, 1, &data->memory, 0, nullptr, nullptr));
+}
 
 class D3D11Sharing : public ::testing::Test {
 protected:
@@ -390,6 +410,84 @@ TEST_F(D3D11Sharing, FailedDependenciesRollBackOwnership) {
     EXPECT_CL_SUCCESS(clReleaseCommandQueue(second_retry_queue));
     EXPECT_CL_SUCCESS(clReleaseCommandQueue(retry_queue));
     EXPECT_CL_SUCCESS(clReleaseMemObject(memory));
+}
+
+TEST_F(D3D11Sharing, EventCallbackCanReenterOwnershipApisDuringRelease) {
+    constexpr size_t size = 64;
+    std::vector<uint8_t> initial(size, 0x6b);
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = static_cast<UINT>(size);
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    D3D11_SUBRESOURCE_DATA data{initial.data(), 0, 0};
+    com_holder<ID3D11Buffer> first_buffer;
+    com_holder<ID3D11Buffer> second_buffer;
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateBuffer(&desc, &data, first_buffer.put())));
+    ASSERT_TRUE(SUCCEEDED(
+        m_d3d_device->CreateBuffer(&desc, &data, second_buffer.put())));
+
+    cl_int error;
+    cl_mem first = clCreateFromD3D11BufferKHR(
+        m_context, CL_MEM_READ_WRITE, first_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(first, nullptr);
+    cl_mem second = clCreateFromD3D11BufferKHR(
+        m_context, CL_MEM_READ_WRITE, second_buffer.get(), &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(second, nullptr);
+
+    cl_command_queue callback_queue =
+        clCreateCommandQueue(m_context, gDevice, 0, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(callback_queue, nullptr);
+    ASSERT_CL_SUCCESS(clEnqueueAcquireD3D11ObjectsKHR(m_queue, 1, &first, 0,
+                                                      nullptr, nullptr));
+    ASSERT_CL_SUCCESS(clFinish(m_queue));
+
+    cl_event gate = clCreateUserEvent(m_context, &error);
+    ASSERT_CL_SUCCESS(error);
+    ASSERT_NE(gate, nullptr);
+    std::vector<uint8_t> readback(size);
+    cl_event read_event = nullptr;
+    ASSERT_CL_SUCCESS(clEnqueueReadBuffer(m_queue, first, CL_FALSE, 0, size,
+                                          readback.data(), 1, &gate,
+                                          &read_event));
+    callback_acquire_data callback_data{callback_queue, second};
+    ASSERT_CL_SUCCESS(clSetEventCallback(read_event, CL_COMPLETE,
+                                         acquire_d3d11_from_callback,
+                                         &callback_data));
+
+    std::atomic<bool> release_started{false};
+    std::atomic<cl_int> gate_result{CL_INVALID_OPERATION};
+    std::thread gate_thread([&] {
+        while (!release_started.load()) {
+            std::this_thread::yield();
+        }
+        // Give the release call time to reach its implicit finish. With the
+        // old lock scope, the callback below then waited on the reservation
+        // mutex while finish waited for the callback, deadlocking both.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        gate_result.store(clSetUserEventStatus(gate, CL_COMPLETE));
+    });
+    release_started.store(true);
+    const cl_int release_result = clEnqueueReleaseD3D11ObjectsKHR(
+        m_queue, 1, &first, 0, nullptr, nullptr);
+    gate_thread.join();
+
+    EXPECT_CL_SUCCESS(release_result);
+    EXPECT_CL_SUCCESS(gate_result.load());
+    EXPECT_CL_SUCCESS(callback_data.result.load());
+    EXPECT_CL_SUCCESS(clFinish(callback_queue));
+    if (callback_data.result.load() == CL_SUCCESS) {
+        EXPECT_CL_SUCCESS(clEnqueueReleaseD3D11ObjectsKHR(
+            callback_queue, 1, &second, 0, nullptr, nullptr));
+    }
+
+    EXPECT_CL_SUCCESS(clReleaseEvent(read_event));
+    EXPECT_CL_SUCCESS(clReleaseEvent(gate));
+    EXPECT_CL_SUCCESS(clReleaseCommandQueue(callback_queue));
+    EXPECT_CL_SUCCESS(clReleaseMemObject(second));
+    EXPECT_CL_SUCCESS(clReleaseMemObject(first));
 }
 
 TEST_F(D3D11Sharing, Texture2DRoundTrip) {

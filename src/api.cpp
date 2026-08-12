@@ -5158,7 +5158,7 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
     // as one reservation if validation or enqueue fails. Serialize only this
     // short host-side reservation window; command execution remains parallel.
     static std::mutex reservation_mutex;
-    std::lock_guard<std::mutex> reservation_lock(reservation_mutex);
+    std::unique_lock<std::mutex> reservation_lock(reservation_mutex);
 
     std::vector<cvk_mem*> objects;
     try {
@@ -5227,6 +5227,12 @@ cl_int enqueue_d3d11_objects(cl_command_queue command_queue,
             }
         }
     }
+    // Command callbacks run synchronously on the thread that completes their
+    // event. Never carry the global reservation lock into finish(): an earlier
+    // callback is allowed to enqueue another D3D11 ownership command, and the
+    // executor must be able to return from that callback for finish to make
+    // progress.
+    reservation_lock.unlock();
     // With CPU-backed interop there is no semaphore that can make future
     // D3D11 submissions wait on this queue. Unless the application opted into
     // explicit synchronization, complete a release before returning so a
