@@ -566,7 +566,7 @@ cl_int cvk_command_queue::flush_no_lock() {
         m_groups.front() = std::move(group);
         return err;
     }
-    m_finish_event = std::move(finish_event);
+    m_finish_event.reset(ev);
 
     return CL_SUCCESS;
 }
