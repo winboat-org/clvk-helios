@@ -132,11 +132,13 @@ struct cvk_context : public _cl_context,
         if (has_interop_user_sync && has_gl_sharing_property) {
             return CL_INVALID_PROPERTY;
         }
-        if (d3d11_device != nullptr && has_gl_sharing_property) {
-            // cl_khr_d3d11_sharing forbids specifying D3D11 interop together
-            // with another graphics-sharing API in the same context.
-            return CL_INVALID_OPERATION;
-        }
+        // WARN: Accepting D3D11 and GL sharing in the same context violates
+        // cl_khr_d3d11_sharing, which requires CL_INVALID_OPERATION:
+        // https://registry.khronos.org/OpenCL/specs/unified/html/OpenCL_API.html#context-properties-table
+        // AMD and Intel accept and initialize both sharing backends, and
+        // DaVinci Resolve relies on that de-facto Windows-driver behavior.
+        // AMD evidence: https://github.com/ROCm/clr/blob/c260fb52336057fe02eb8ddbdb7cb073cdb921bf/rocclr/platform/context.cpp
+        // Intel evidence: https://github.com/intel/compute-runtime/blob/b8775162a0727dbc04a343033c7d21f3e83de9c5/opencl/source/sharings/sharing_factory.cpp
         if ((gl_context == nullptr) != (gl_device_context == nullptr)) {
             return CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR;
         }

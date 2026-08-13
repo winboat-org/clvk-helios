@@ -319,7 +319,7 @@ TEST_F(D3D11Sharing, ExplicitNullD3D11DeviceUsesDefaultContext) {
     EXPECT_CL_SUCCESS(clReleaseContext(context));
 }
 
-TEST_F(D3D11Sharing, RejectsCombinedD3D11AndGlSharingContext) {
+TEST_F(D3D11Sharing, DoesNotRejectCombinedD3D11AndGlSharingContext) {
     const cl_context_properties properties[] = {
         CL_CONTEXT_PLATFORM,
         reinterpret_cast<cl_context_properties>(gPlatform),
@@ -335,7 +335,10 @@ TEST_F(D3D11Sharing, RejectsCombinedD3D11AndGlSharingContext) {
     cl_context context =
         clCreateContext(properties, 1, &gDevice, nullptr, nullptr, &error);
     EXPECT_EQ(context, nullptr);
-    EXPECT_EQ(error, CL_INVALID_OPERATION);
+    // The deliberately invalid WGL handles are rejected only when GL sharing
+    // is initialized. Reaching that validation proves the mixed combination
+    // itself was accepted for compatibility with AMD and Intel runtimes.
+    EXPECT_EQ(error, CL_INVALID_GL_SHAREGROUP_REFERENCE_KHR);
 }
 
 TEST_F(D3D11Sharing, KernelAccessFlagsDoNotElideOwnershipCopies) {
